@@ -121,6 +121,8 @@ def api_provider_from_base_url(base_url: str) -> str:
         return "openrouter"
     if "yunwu.ai" in normalized:
         return "yunwu"
+    if "agnes-ai.com" in normalized:
+        return "agnes"
     return ""
 
 
