@@ -14,6 +14,7 @@ from .reranker_bge_silicon_api import RerankerBgeSiliconapi
 
 # video generators
 from .video_generator_doubao_seedance_yunwu_api import VideoGeneratorDoubaoSeedanceYunwuAPI
+from .video_generator_agnes_api import AgnesVideoProvider
 from .video_generator_omni_yunwu_api import VideoGeneratorOmniYunwuAPI, VideoGeneratorOminiYunwuAPI
 from .video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from .video_generator_veo_google_api import VideoGeneratorVeoGoogleAPI
@@ -31,6 +32,7 @@ __all__ = [
     "ImageGeneratorOpenRouterAPI",
     "RerankerBgeSiliconapi",
     "VideoGeneratorDoubaoSeedanceYunwuAPI",
+    "AgnesVideoProvider",
     "VideoGeneratorOmniYunwuAPI",
     "VideoGeneratorOminiYunwuAPI",
     "VideoGeneratorOpenRouterAPI",
