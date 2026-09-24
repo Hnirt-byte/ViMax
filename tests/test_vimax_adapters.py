@@ -69,6 +69,35 @@ class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
         return str(final)
 
 
+class SceneRenderIdeaPipeline(FakeIdeaPipeline):
+    portrait_calls = []
+
+    async def generate_character_portraits(self, characters, character_portraits_registry, style, progress=None):
+        self.__class__.portrait_calls.append({"working_dir": self.working_dir, "characters": characters, "style": style})
+        return character_portraits_registry or {}
+
+
+class SceneRenderScriptPipeline:
+    render_calls = []
+
+    def __init__(self, chat_model, image_generator, video_generator, working_dir):
+        self.working_dir = Path(working_dir)
+        self.working_dir.mkdir(parents=True, exist_ok=True)
+
+    async def __call__(self, script, user_requirement, style, characters=None, character_portraits_registry=None, quiet=False, progress=None):
+        self.__class__.render_calls.append({
+            "working_dir": self.working_dir,
+            "script": script,
+            "user_requirement": user_requirement,
+            "style": style,
+            "characters": characters,
+            "character_portraits_registry": character_portraits_registry,
+        })
+        final = self.working_dir / "final_video.mp4"
+        final.write_text("scene-video", encoding="utf-8")
+        return str(final)
+
+
 class FakeScriptPipeline:
     def __init__(self, chat_model, image_generator, video_generator, working_dir):
         self.working_dir = Path(working_dir)
@@ -466,3 +495,52 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.vimax_render_video({})
             self.assertFalse(result.ok)
             self.assertEqual(result.metadata["error_type"], "dependency_missing")
+
+    async def test_render_scene_only_uses_selected_idea_scene_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane", user_requirement="vertical", style="cinematic")
+            idea_dir = Path(tmp) / record["working_dir"] / "idea2video"
+            idea_dir.mkdir(parents=True, exist_ok=True)
+            (idea_dir / "story.txt").write_text("story", encoding="utf-8")
+            (idea_dir / "characters.json").write_text("[]", encoding="utf-8")
+            (idea_dir / "script.json").write_text(json.dumps(["scene zero", "scene one"]), encoding="utf-8")
+            for scene_name in ("scene_0", "scene_1"):
+                scene_dir = idea_dir / scene_name / "shots" / "0"
+                scene_dir.mkdir(parents=True, exist_ok=True)
+                (scene_dir.parent.parent / "storyboard.json").write_text("[]", encoding="utf-8")
+                (scene_dir.parent.parent / "camera_tree.json").write_text("[]", encoding="utf-8")
+                (scene_dir / "shot_description.json").write_text("{}", encoding="utf-8")
+            SceneRenderIdeaPipeline.portrait_calls = []
+            SceneRenderScriptPipeline.render_calls = []
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", SceneRenderIdeaPipeline), \
+                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", SceneRenderScriptPipeline):
+                result = await adapter.vimax_render_scene({"session_id": record["session_id"], "scene_id": "scene_1"})
+            self.assertTrue(result.ok)
+            self.assertEqual(result.metadata["scene_id"], "scene_1")
+            self.assertEqual(len(SceneRenderScriptPipeline.render_calls), 1)
+            self.assertEqual(SceneRenderScriptPipeline.render_calls[0]["working_dir"], idea_dir / "scene_1")
+            self.assertEqual(SceneRenderScriptPipeline.render_calls[0]["script"], "scene one")
+            self.assertTrue((idea_dir / "scene_1" / "final_video.mp4").exists())
+            self.assertFalse((idea_dir / "scene_0" / "final_video.mp4").exists())
+
+    async def test_render_scene_reuses_existing_scene_video_without_initializing_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_0"
+            scene_dir.mkdir(parents=True, exist_ok=True)
+            (scene_dir / "final_video.mp4").write_text("cached-scene-video", encoding="utf-8")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", side_effect=AssertionError("chat model must not initialize")), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", side_effect=AssertionError("image provider must not initialize")), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", side_effect=AssertionError("video provider must not initialize")):
+                result = await adapter.vimax_render_scene({"session_id": record["session_id"], "scene_id": "scene_0"})
+            self.assertTrue(result.ok)
+            self.assertTrue(result.metadata["render_cached"])
+            self.assertFalse(result.metadata["render_started"])
+            self.assertEqual(result.metadata["scene_video_path"], f"{record['working_dir']}/idea2video/scene_0/final_video.mp4")

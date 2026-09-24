@@ -94,6 +94,19 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
                 "force": ToolArgumentSchema(bool, required=False, default=False),
             },
         ),
+        ToolSpec(
+            name="vimax_render_scene",
+            description=(
+                "Render exactly one planned idea2video scene without rendering or concatenating other scenes. "
+                "The selected scene reuses its existing storyboard, shot descriptions, camera tree, frames, clips, and scene final_video.mp4 cache under idea2video/scene_<n>/. "
+                "Use only for an idea2video session after narrative planning; scene_id must be an exact value such as scene_0."
+            ),
+            handler=adapter.vimax_render_scene,
+            schema={
+                "session_id": ToolArgumentSchema(str, required=False, default=""),
+                "scene_id": ToolArgumentSchema(str, required=True),
+            },
+        ),
     ]
 
 
@@ -422,6 +435,132 @@ class ViMaxAdapters:
         _write_render_status(working_dir, status="dependency_missing", payload=payload)
         return ToolResult("vimax_render_video", False, "No render mode matched current session.", payload)
 
+    async def vimax_render_scene(self, args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
+        session_id = str(args.get("session_id", "") or "").strip()
+        scene_id = str(args.get("scene_id", "") or "").strip()
+        session = self.session_index.get(session_id) if session_id else self.session_index.active()
+        if session is None:
+            return ToolResult("vimax_render_scene", False, "No active session to render.", {"error_type": "missing_session"})
+        if not _is_valid_idea_scene_id(scene_id):
+            return ToolResult(
+                "vimax_render_scene",
+                False,
+                "scene_id must use the exact format scene_<n>.",
+                {"error_type": "invalid_scene_id", "session_id": session["session_id"], "scene_id": scene_id},
+            )
+
+        session_id = session["session_id"]
+        working_dir = self.session_index.working_dir(session_id)
+        idea_dir = working_dir / "idea2video"
+        scene_dir = idea_dir / scene_id
+        final_video_path = scene_dir / "final_video.mp4"
+        if final_video_path.exists():
+            self.session_index.update_stage(session_id, "scene_rendered", f"Scene {scene_id} render cache reused")
+            payload = {
+                "session_id": session_id,
+                "scene_id": scene_id,
+                "render_mode": "idea2video_scene",
+                "render_started": False,
+                "render_completed": True,
+                "render_cached": True,
+                "scene_video_path": str(final_video_path.relative_to(self.workspace_root)),
+                "missing": [],
+            }
+            _write_render_status(scene_dir, status="rendered", payload=payload)
+            if runtime:
+                runtime.emit_progress("Selected scene already rendered; cache reused", stage="scene_render_cached", metadata={"session_id": session_id, "scene_id": scene_id})
+            return ToolResult("vimax_render_scene", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
+
+        missing = _missing_idea_scene_dependencies(idea_dir, scene_dir)
+        if missing:
+            payload = {
+                "error_type": "dependency_missing",
+                "session_id": session_id,
+                "scene_id": scene_id,
+                "missing": missing,
+            }
+            _write_render_status(scene_dir, status="dependency_missing", payload=payload)
+            return ToolResult("vimax_render_scene", False, f"Dependency missing: {', '.join(missing)}", payload)
+
+        try:
+            scene_script = _load_idea_scene_script(idea_dir / "script.json", scene_id)
+            characters_path = scene_dir / "characters.json"
+            if not characters_path.exists():
+                characters_path = idea_dir / "characters.json"
+            characters = _load_characters(characters_path)
+
+            self.session_index.update_stage(session_id, "scene_rendering", f"Rendering {scene_id}")
+            payload = {
+                "session_id": session_id,
+                "scene_id": scene_id,
+                "render_mode": "idea2video_scene",
+                "render_started": True,
+                "render_completed": False,
+            }
+            _write_render_status(scene_dir, status="rendering", payload=payload)
+            if runtime:
+                runtime.emit_progress("Starting selected scene render", stage="scene_rendering", metadata={"session_id": session_id, "scene_id": scene_id})
+
+            chat_model = _build_chat_model()
+            image_generator = _build_image_generator()
+            video_generator = _build_video_generator()
+            portrait_pipeline = Idea2VideoPipeline(
+                chat_model=chat_model,
+                image_generator=image_generator,
+                video_generator=video_generator,
+                working_dir=str(idea_dir),
+            )
+            with _suppress_pipeline_output():
+                character_portraits_registry = await portrait_pipeline.generate_character_portraits(
+                    characters=characters,
+                    character_portraits_registry=None,
+                    style=str(session.get("style", "")),
+                )
+                pipeline = Script2VideoPipeline(
+                    chat_model=chat_model,
+                    image_generator=image_generator,
+                    video_generator=video_generator,
+                    working_dir=str(scene_dir),
+                )
+                final_video = await pipeline(
+                    script=scene_script,
+                    user_requirement=str(session.get("user_requirement", "")),
+                    style=str(session.get("style", "")),
+                    characters=characters,
+                    character_portraits_registry=character_portraits_registry,
+                    quiet=True,
+                    progress=_pipeline_progress(runtime, session_id, scene_index=_idea_scene_index(scene_id)),
+                )
+
+            self.session_index.update_stage(session_id, "scene_rendered", f"Rendered {scene_id}")
+            payload = {
+                "session_id": session_id,
+                "scene_id": scene_id,
+                "render_mode": "idea2video_scene",
+                "render_started": True,
+                "render_completed": True,
+                "render_cached": False,
+                "scene_video_path": str(Path(final_video).relative_to(self.workspace_root)),
+                "missing": [],
+            }
+            _write_render_status(scene_dir, status="rendered", payload=payload)
+            return ToolResult("vimax_render_scene", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
+        except Exception as exc:
+            unwrapped = _unwrap_retry_error(exc)
+            error_text = _sanitize_error_text(str(unwrapped))
+            self.session_index.update_stage(session_id, "error", f"Scene {scene_id} render failed: {error_text}")
+            payload = {
+                "error_type": "render_failed",
+                "retryable": _is_retryable_render_error(unwrapped),
+                "session_id": session_id,
+                "scene_id": scene_id,
+                "error": error_text,
+            }
+            _write_render_status(scene_dir, status="error", payload=payload)
+            if runtime:
+                runtime.emit_progress("Selected scene render failed; partial artifacts were kept", stage="scene_render_failed", metadata=payload)
+            return ToolResult("vimax_render_scene", False, f"Render failed: {error_text}", payload)
+
     def _resolve_session(self, session_id: str, *, idea: str, script: str, user_requirement: str, style: str) -> dict[str, Any]:
         requested_source = idea or script
         if session_id:
@@ -746,6 +885,45 @@ def _load_script_text(working_dir: Path) -> str:
     if story.exists():
         return story.read_text(encoding="utf-8")
     return ""
+
+
+def _is_valid_idea_scene_id(scene_id: str) -> bool:
+    if not scene_id.startswith("scene_"):
+        return False
+    suffix = scene_id.removeprefix("scene_")
+    return suffix.isdigit() and f"scene_{int(suffix)}" == scene_id
+
+
+def _idea_scene_index(scene_id: str) -> int:
+    if not _is_valid_idea_scene_id(scene_id):
+        raise ValueError(f"Invalid idea scene_id: {scene_id}")
+    return int(scene_id.removeprefix("scene_"))
+
+
+def _missing_idea_scene_dependencies(idea_dir: Path, scene_dir: Path) -> list[str]:
+    missing: list[str] = []
+    if not (idea_dir / "script.json").exists():
+        missing.append("idea2video/script.json")
+    if not (scene_dir / "characters.json").exists() and not (idea_dir / "characters.json").exists():
+        missing.append(f"{scene_dir.name}/characters.json or idea2video/characters.json")
+    if not (scene_dir / "storyboard.json").exists():
+        missing.append(f"{scene_dir.name}/storyboard.json")
+    if not (scene_dir / "camera_tree.json").exists():
+        missing.append(f"{scene_dir.name}/camera_tree.json")
+    if not any((scene_dir / "shots").glob("*/shot_description.json")):
+        missing.append(f"{scene_dir.name}/shots/*/shot_description.json")
+    return missing
+
+
+def _load_idea_scene_script(script_path: Path, scene_id: str) -> str:
+    scripts = json.loads(script_path.read_text(encoding="utf-8"))
+    if not isinstance(scripts, list):
+        raise ValueError("idea2video/script.json must contain a scene list")
+    scene_index = _idea_scene_index(scene_id)
+    if scene_index >= len(scripts):
+        raise ValueError(f"No script entry for {scene_id}")
+    scene_script = scripts[scene_index]
+    return scene_script if isinstance(scene_script, str) else json.dumps(scene_script, ensure_ascii=False, indent=2)
 
 
 def _resolve_artifact_path(working_dir: Path, revision_target: str) -> Path:
