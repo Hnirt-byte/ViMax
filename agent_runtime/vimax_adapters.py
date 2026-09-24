@@ -29,7 +29,7 @@ from tools.video_generator_agnes_api import AgnesVideoProvider
 from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
 
-from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_api_key, video_base_url, video_model, video_provider
+from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_allow_paid_fallback, video_api_key, video_base_url, video_model, video_paid_fallback_model, video_provider
 from .models import ToolResult
 from .tools import ToolArgumentSchema, ToolRuntimeContext, ToolSpec
 
@@ -740,7 +740,13 @@ def _build_video_generator() -> Any:
     if provider == "openrouter":
         return VideoGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url)
     if provider == "agnes":
-        return AgnesVideoProvider(api_key=api_key, model=model, base_url=base_url)
+        return AgnesVideoProvider(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            allow_paid_video_fallback=video_allow_paid_fallback(),
+            paid_fallback_model=video_paid_fallback_model(),
+        )
     if provider == "yunwu":
         return VideoGeneratorVeoYunwuAPI(api_key=api_key, t2v_model=model, ff2v_model=model, base_url=base_url)
     raise RuntimeError(f"Unsupported video base_url for automatic provider matching: {base_url}")

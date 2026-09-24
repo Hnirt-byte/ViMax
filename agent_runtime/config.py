@@ -14,6 +14,7 @@ DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 DEFAULT_IMAGE_BASE_URL = "https://yunwu.ai"
 DEFAULT_VIDEO_MODEL = "veo3.1-fast"
 DEFAULT_VIDEO_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_VIDEO_PAID_FALLBACK_MODEL = "agnes-video-2.5"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDING_MODEL_PROVIDER = "openai"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -44,6 +45,31 @@ def config_value(section: str, key: str, env_names: list[str], default: str = ""
         if isinstance(value, str) and value:
             return value
     return default
+
+
+def config_bool(section: str, key: str, env_names: list[str], default: bool = False, workspace_root: str | Path = ".") -> bool:
+    for env_name in env_names:
+        value = os.environ.get(env_name)
+        if value:
+            return _parse_bool(value, f"environment variable {env_name}")
+    section_payload = load_agent_config(workspace_root).get(section, {})
+    if isinstance(section_payload, dict) and key in section_payload:
+        value = section_payload[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value:
+            return _parse_bool(value, f"configs/agent.local.yaml {section}.{key}")
+        raise RuntimeError(f"configs/agent.local.yaml {section}.{key} must be a boolean")
+    return default
+
+
+def _parse_bool(value: str, source: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{source} must be one of true/false, yes/no, on/off, or 1/0")
 
 
 def llm_model(workspace_root: str | Path = ".") -> str:
@@ -113,6 +139,14 @@ def video_base_url(workspace_root: str | Path = ".") -> str:
 
 def video_api_key(workspace_root: str | Path = ".") -> str:
     return config_value("video", "api_key", ["VIMAX_VIDEO_API_KEY", "VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], llm_api_key(workspace_root), workspace_root)
+
+
+def video_allow_paid_fallback(workspace_root: str | Path = ".") -> bool:
+    return config_bool("video", "allow_paid_video_fallback", ["VIMAX_ALLOW_PAID_VIDEO_FALLBACK"], False, workspace_root)
+
+
+def video_paid_fallback_model(workspace_root: str | Path = ".") -> str:
+    return config_value("video", "paid_fallback_model", ["VIMAX_PAID_VIDEO_FALLBACK_MODEL"], DEFAULT_VIDEO_PAID_FALLBACK_MODEL, workspace_root)
 
 
 def api_provider_from_base_url(base_url: str) -> str:

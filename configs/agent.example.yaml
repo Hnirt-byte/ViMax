@@ -16,6 +16,10 @@ video:
   model: <YOUR_VIDEO_MODEL>
   base_url: <YOUR_VIDEO_BASE_URL>
   api_key: ''
+  # Agnes-only: disabled by default. Switches to paid_fallback_model only after
+  # the configured Flash video_queue_full submit attempts are exhausted.
+  allow_paid_video_fallback: false
+  paid_fallback_model: agnes-video-2.5
 
 # Optional. Fill these only when using novel2video planning.
 embedding:

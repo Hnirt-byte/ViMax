@@ -1,5 +1,8 @@
 import asyncio
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from agent_runtime.vimax_adapters import _build_video_generator
@@ -266,6 +269,118 @@ class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(post.await_count, 1)
         self.assertEqual(get.await_count, 2)
 
+    async def test_flash_success_does_not_use_paid_fallback(self):
+        post = AsyncMock(return_value=(200, {"video_id": "flash-task"}))
+        get = AsyncMock(return_value=(200, {"status": "completed", "url": "https://cdn.example.test/result.mp4"}))
+        download = AsyncMock(return_value=(200, b"video"))
+        events = []
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            allow_paid_video_fallback=True,
+            paid_fallback_model="agnes-video-2.5",
+            poll_interval_seconds=0,
+        )
+        with patch("tools.video_generator_agnes_api._post_json", post), \
+             patch("tools.video_generator_agnes_api._get_json", get), \
+             patch("tools.video_generator_agnes_api._get_bytes", download):
+            await provider.generate_single_video(
+                "A red paper airplane glides through a clear sky.",
+                ["https://images.example.test/scene-0-first-frame.png"],
+                progress=lambda stage, message, metadata: events.append((stage, metadata)),
+            )
+
+        self.assertEqual(post.await_count, 1)
+        self.assertEqual(post.await_args.kwargs["payload"]["model"], "agnes-video-2.5-flash")
+        self.assertNotIn("video_paid_fallback", [stage for stage, _ in events])
+
+    async def test_flash_queue_full_refuses_paid_fallback_when_disabled(self):
+        post = AsyncMock(return_value=(503, {"code": "video_queue_full", "message": "video queue is full"}))
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            allow_paid_video_fallback=False,
+            paid_fallback_model="agnes-video-2.5",
+            queue_max_attempts=1,
+        )
+        with patch("tools.video_generator_agnes_api._post_json", post):
+            with self.assertRaisesRegex(AgnesVideoAPIError, "video_queue_full"):
+                await provider.generate_single_video(
+                    "A red paper airplane glides through a clear sky.",
+                    ["https://images.example.test/scene-0-first-frame.png"],
+                )
+
+        self.assertEqual(post.await_count, 1)
+        self.assertEqual(post.await_args.kwargs["payload"]["model"], "agnes-video-2.5-flash")
+
+    async def test_flash_queue_full_uses_explicit_paid_fallback_with_same_first_frame(self):
+        post = AsyncMock(side_effect=[
+            (503, {"code": "video_queue_full", "message": "video queue is full"}),
+            (200, {"video_id": "standard-task"}),
+        ])
+        get = AsyncMock(return_value=(200, {"status": "completed", "url": "https://cdn.example.test/result.mp4"}))
+        download = AsyncMock(return_value=(200, b"video"))
+        events = []
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            allow_paid_video_fallback=True,
+            paid_fallback_model="agnes-video-2.5",
+            queue_max_attempts=1,
+            poll_interval_seconds=0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            first_frame = Path(tmp) / "scene-0-first-frame.png"
+            first_frame.write_bytes(b"cached-image")
+            Path(f"{first_frame}.source.json").write_text(
+                json.dumps({"source_url": "https://images.example.test/scene-0-first-frame.png"}),
+                encoding="utf-8",
+            )
+            with patch("tools.video_generator_agnes_api._post_json", post), \
+                 patch("tools.video_generator_agnes_api._get_json", get), \
+                 patch("tools.video_generator_agnes_api._get_bytes", download):
+                await provider.generate_single_video(
+                    "A red paper airplane glides through a clear sky.",
+                    [str(first_frame)],
+                    progress=lambda stage, message, metadata: events.append((stage, metadata)),
+                )
+
+        self.assertEqual(post.await_count, 2)
+        flash_payload, standard_payload = [call.kwargs["payload"] for call in post.await_args_list]
+        self.assertEqual(flash_payload["model"], "agnes-video-2.5-flash")
+        self.assertEqual(standard_payload["model"], "agnes-video-2.5")
+        self.assertEqual(flash_payload["first_frame"], "https://images.example.test/scene-0-first-frame.png")
+        self.assertEqual(standard_payload["first_frame"], "https://images.example.test/scene-0-first-frame.png")
+        create_models = [metadata["model"] for stage, metadata in events if stage == "video_create"]
+        self.assertEqual(create_models, ["agnes-video-2.5-flash", "agnes-video-2.5"])
+        fallback_events = [metadata for stage, metadata in events if stage == "video_paid_fallback"]
+        self.assertEqual(fallback_events, [{
+            "from_model": "agnes-video-2.5-flash",
+            "to_model": "agnes-video-2.5",
+            "reason": "video_queue_full",
+        }])
+
+    async def test_paid_fallback_never_submits_after_flash_video_id(self):
+        post = AsyncMock(return_value=(200, {"video_id": "flash-task"}))
+        get = AsyncMock(side_effect=[
+            (429, {"error": {"message": "status rate limited"}}),
+            (200, {"status": "completed", "url": "https://cdn.example.test/result.mp4"}),
+        ])
+        download = AsyncMock(return_value=(200, b"video"))
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            allow_paid_video_fallback=True,
+            paid_fallback_model="agnes-video-2.5",
+            max_retries=2,
+            retry_base_delay_seconds=0,
+            poll_interval_seconds=0,
+        )
+        with patch("tools.video_generator_agnes_api._post_json", post), \
+             patch("tools.video_generator_agnes_api._get_json", get), \
+             patch("tools.video_generator_agnes_api._get_bytes", download), \
+             patch("tools.video_generator_agnes_api.asyncio.sleep", AsyncMock()):
+            await provider.generate_single_video("A red paper airplane glides through a clear sky.")
+
+        self.assertEqual(post.await_count, 1)
+        self.assertEqual(post.await_args.kwargs["payload"]["model"], "agnes-video-2.5-flash")
+
     async def test_retries_timeout_then_raises_timeout(self):
         post = AsyncMock(side_effect=asyncio.TimeoutError)
         provider = AgnesVideoProvider(api_key="test-key", max_retries=2, retry_base_delay_seconds=0)
@@ -295,11 +410,15 @@ class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
         with patch("agent_runtime.vimax_adapters.video_api_key", return_value="test-key"), \
              patch("agent_runtime.vimax_adapters.video_model", return_value="agnes-video-2.5-flash"), \
              patch("agent_runtime.vimax_adapters.video_base_url", return_value="https://apihub.agnes-ai.com/v1"), \
+             patch("agent_runtime.vimax_adapters.video_allow_paid_fallback", return_value=True), \
+             patch("agent_runtime.vimax_adapters.video_paid_fallback_model", return_value="agnes-video-2.5"), \
              patch("agent_runtime.vimax_adapters.video_provider", return_value="agnes"):
             provider = _build_video_generator()
 
         self.assertIsInstance(provider, AgnesVideoProvider)
         self.assertEqual(getattr(provider, "model"), "agnes-video-2.5-flash")
+        self.assertTrue(getattr(provider, "allow_paid_video_fallback"))
+        self.assertEqual(getattr(provider, "paid_fallback_model"), "agnes-video-2.5")
 
 
 if __name__ == "__main__":

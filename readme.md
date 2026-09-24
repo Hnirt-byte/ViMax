@@ -252,6 +252,10 @@ video:
   model: <YOUR_VIDEO_MODEL>
   base_url: <YOUR_VIDEO_BASE_URL>
   api_key: <YOUR_API_KEY>
+  # Agnes-only, disabled by default. Uses this model only after Flash
+  # video_queue_full submit attempts are exhausted.
+  allow_paid_video_fallback: false
+  paid_fallback_model: agnes-video-2.5
 ```
 
 Then, start the TUI from the ViMax root directory:
@@ -266,7 +270,7 @@ vimax tui resume
 vimax tui resume <session_id>
 ```
 
-You can also keep `configs/agent.local.yaml` empty and provide the same values through environment variables, such as `VIMAX_LLM_API_KEY`, `VIMAX_IMAGE_API_KEY`, and `VIMAX_VIDEO_API_KEY`.
+You can also keep `configs/agent.local.yaml` empty and provide the same values through environment variables, such as `VIMAX_LLM_API_KEY`, `VIMAX_IMAGE_API_KEY`, and `VIMAX_VIDEO_API_KEY`. The optional Agnes paid fallback remains disabled unless `VIMAX_ALLOW_PAID_VIDEO_FALLBACK=true` (with an optional `VIMAX_PAID_VIDEO_FALLBACK_MODEL=agnes-video-2.5`) is explicitly set.
 
 </details>
 

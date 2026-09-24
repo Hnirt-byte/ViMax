@@ -24,8 +24,10 @@ from agent_runtime.config import (
     reranker_base_url,
     reranker_model,
     video_api_key,
+    video_allow_paid_fallback,
     video_base_url,
     video_model,
+    video_paid_fallback_model,
     video_provider,
 )
 
@@ -44,7 +46,7 @@ class AgentConfigTests(unittest.TestCase):
             (config_dir / "agent.local.yaml").write_text(yaml.safe_dump({
                 "llm": {"model_provider": "openai", "model": "config-llm", "base_url": "https://config.test/v1", "api_key": "config-key"},
                 "image": {"model": "config-image", "base_url": "https://image.test", "api_key": "image-key"},
-                "video": {"model": "config-video", "base_url": "https://openrouter.ai/api/v1", "api_key": "video-key"},
+                "video": {"model": "config-video", "base_url": "https://openrouter.ai/api/v1", "api_key": "video-key", "allow_paid_video_fallback": True, "paid_fallback_model": "agnes-video-2.5"},
                 "embedding": {"model_provider": "openai", "model": "config-embedding", "base_url": "https://embedding.test/v1", "api_key": "embedding-key"},
                 "reranker": {"model": "config-reranker", "base_url": "https://reranker.test", "api_key": "reranker-key"},
             }), encoding="utf-8")
@@ -60,6 +62,8 @@ class AgentConfigTests(unittest.TestCase):
                 self.assertEqual(video_provider(tmp), "openrouter")
                 self.assertEqual(video_base_url(tmp), "https://openrouter.ai/api/v1")
                 self.assertEqual(video_api_key(tmp), "video-key")
+                self.assertTrue(video_allow_paid_fallback(tmp))
+                self.assertEqual(video_paid_fallback_model(tmp), "agnes-video-2.5")
                 self.assertEqual(embedding_model_provider(tmp), "openai")
                 self.assertEqual(embedding_model(tmp), "config-embedding")
                 self.assertEqual(embedding_base_url(tmp), "https://embedding.test/v1")
@@ -99,6 +103,12 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(api_provider_from_base_url("https://openrouter.ai/api/v1"), "openrouter")
         self.assertEqual(api_provider_from_base_url("https://yunwu.ai/v1"), "yunwu")
         self.assertEqual(api_provider_from_base_url("https://example.com/v1"), "")
+
+    def test_video_paid_fallback_is_opt_in_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(video_allow_paid_fallback(tmp))
+                self.assertEqual(video_paid_fallback_model(tmp), "agnes-video-2.5")
 
 
 if __name__ == "__main__":

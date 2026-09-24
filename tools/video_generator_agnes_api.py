@@ -16,6 +16,7 @@ from utils.rate_limiter import RateLimiter
 
 DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_MODEL = "agnes-video-2.5-flash"
+DEFAULT_PAID_FALLBACK_MODEL = "agnes-video-2.5"
 # Deprecated compatibility path. New reference jobs use the configured 2.5 model.
 DEFAULT_REFERENCE_MODEL = "agnes-video-v2.0"
 logger = logging.getLogger(__name__)
@@ -49,6 +50,8 @@ class AgnesVideoProvider:
         queue_retry_base_delay_seconds: float = 30.0,
         queue_retry_max_delay_seconds: float = 300.0,
         queue_retry_multiplier: float = 2.0,
+        allow_paid_video_fallback: bool = False,
+        paid_fallback_model: str = DEFAULT_PAID_FALLBACK_MODEL,
         rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.api_key = api_key
@@ -68,6 +71,8 @@ class AgnesVideoProvider:
         self.queue_retry_base_delay_seconds = max(0.0, queue_retry_base_delay_seconds)
         self.queue_retry_max_delay_seconds = max(self.queue_retry_base_delay_seconds, queue_retry_max_delay_seconds)
         self.queue_retry_multiplier = max(1.0, queue_retry_multiplier)
+        self.allow_paid_video_fallback = allow_paid_video_fallback
+        self.paid_fallback_model = paid_fallback_model.strip() or DEFAULT_PAID_FALLBACK_MODEL
         self.rate_limiter = rate_limiter
 
     async def generate_single_video(
@@ -88,49 +93,46 @@ class AgnesVideoProvider:
         duration = seconds or self.default_seconds
         ratio = aspect_ratio or self.default_aspect_ratio
         resolution = kwargs.get("resolution", self.default_resolution)
-        if references:
-            if self.model == self.reference_model:
-                model = self.reference_model
-                payload = _build_v2_reference_payload(
-                    model=model,
-                    prompt=prompt,
-                    references=references,
-                    aspect_ratio=ratio,
-                    seconds=duration,
-                    resolution=resolution,
-                    seed=kwargs.get("seed"),
-                    negative_prompt=kwargs.get("negative_prompt"),
-                )
-            else:
-                model = self.model
-                payload = _build_25_keyframe_payload(
-                    model=model,
-                    prompt=prompt,
-                    references=references,
-                    aspect_ratio=ratio,
-                    seconds=duration,
-                    resolution=resolution,
-                    seed=kwargs.get("seed"),
-                )
-        else:
-            model = self.model
-            payload = {
-                "model": model,
-                "prompt": prompt,
-                "mode": "text",
-                "seconds": str(duration),
-                "aspect_ratio": ratio,
-                "size": resolution,
-                "n": 1,
-            }
-            if kwargs.get("seed") is not None:
-                payload["seed"] = kwargs["seed"]
-        _emit_progress(progress, "video_create", f"Creating Agnes video task with {model}", {"model": model})
-        _, response = await self._request_with_retry(
-            lambda: self._post_json(f"{self.base_url}/videos", payload),
-            progress=progress,
-            operation_name="create",
+        model = self.reference_model if references and self.model == self.reference_model else self.model
+        payload = self._create_payload(
+            model=model,
+            prompt=prompt,
+            references=references,
+            aspect_ratio=ratio,
+            seconds=duration,
+            resolution=resolution,
+            seed=kwargs.get("seed"),
+            negative_prompt=kwargs.get("negative_prompt"),
         )
+        try:
+            _, response = await self._create_task(model=model, payload=payload, progress=progress)
+        except AgnesVideoAPIError as exc:
+            if not self._can_use_paid_fallback(model, exc):
+                raise
+            fallback_model = self.paid_fallback_model
+            logger.warning(
+                "Agnes Video Flash queue remained full after %d submit attempts; using explicitly enabled paid fallback model %s",
+                self.queue_max_attempts,
+                fallback_model,
+            )
+            _emit_progress(
+                progress,
+                "video_paid_fallback",
+                f"Agnes Video Flash queue remained full; using explicitly enabled paid fallback {fallback_model}",
+                {"from_model": model, "to_model": fallback_model, "reason": "video_queue_full"},
+            )
+            model = fallback_model
+            payload = self._create_payload(
+                model=model,
+                prompt=prompt,
+                references=references,
+                aspect_ratio=ratio,
+                seconds=duration,
+                resolution=resolution,
+                seed=kwargs.get("seed"),
+                negative_prompt=kwargs.get("negative_prompt"),
+            )
+            _, response = await self._create_task(model=model, payload=payload, progress=progress)
         task_id = _task_id_from_response(response)
         _emit_progress(progress, "video_task_created", "Agnes video task created", {"model": model, "task_id": task_id})
 
@@ -140,6 +142,7 @@ class AgnesVideoProvider:
                 lambda: self._get_json(self._status_url(task_id, model)),
                 progress=progress,
                 operation_name="poll",
+                model=model,
             )
             task_status = _status_from_response(result)
             _emit_progress(progress, "video_status", f"Agnes video status: {task_status}", {"model": model, "task_id": task_id, "status": task_status})
@@ -150,6 +153,7 @@ class AgnesVideoProvider:
                     lambda: self._get_bytes(video_url),
                     progress=progress,
                     operation_name="download",
+                    model=model,
                 )
                 _emit_progress(progress, "video_completed", "Agnes video generation completed", {"model": model, "task_id": task_id})
                 return VideoOutput(fmt="bytes", ext="mp4", data=video_bytes)
@@ -158,6 +162,76 @@ class AgnesVideoProvider:
             await asyncio.sleep(self.poll_interval_seconds)
 
         raise TimeoutError(f"Agnes video task {task_id} timed out after {self.poll_timeout_seconds:g}s")
+
+    def _create_payload(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        references: Sequence[str],
+        aspect_ratio: str,
+        seconds: int,
+        resolution: str,
+        seed: Any,
+        negative_prompt: Any,
+    ) -> dict[str, Any]:
+        if references:
+            if model == self.reference_model:
+                return _build_v2_reference_payload(
+                    model=model,
+                    prompt=prompt,
+                    references=references,
+                    aspect_ratio=aspect_ratio,
+                    seconds=seconds,
+                    resolution=resolution,
+                    seed=seed,
+                    negative_prompt=negative_prompt,
+                )
+            return _build_25_keyframe_payload(
+                model=model,
+                prompt=prompt,
+                references=references,
+                aspect_ratio=aspect_ratio,
+                seconds=seconds,
+                resolution=resolution,
+                seed=seed,
+            )
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "mode": "text",
+            "seconds": str(seconds),
+            "aspect_ratio": aspect_ratio,
+            "size": resolution,
+            "n": 1,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        return payload
+
+    async def _create_task(
+        self,
+        *,
+        model: str,
+        payload: dict[str, Any],
+        progress: Callable[[str, str, dict[str, Any]], None] | None,
+    ) -> tuple[int, Any]:
+        logger.info("Creating Agnes video task with selected model %s", model)
+        _emit_progress(progress, "video_create", f"Creating Agnes video task with {model}", {"model": model})
+        return await self._request_with_retry(
+            lambda: self._post_json(f"{self.base_url}/videos", payload),
+            progress=progress,
+            operation_name="create",
+            model=model,
+        )
+
+    def _can_use_paid_fallback(self, model: str, exc: AgnesVideoAPIError) -> bool:
+        return (
+            self.allow_paid_video_fallback
+            and _is_video_queue_full_error(exc)
+            and model.endswith("-flash")
+            and self.paid_fallback_model != model
+        )
 
     async def _post_json(self, url: str, payload: dict[str, Any]) -> tuple[int, Any]:
         if self.rate_limiter is not None:
@@ -178,6 +252,7 @@ class AgnesVideoProvider:
         *,
         progress: Callable[[str, str, dict[str, Any]], None] | None,
         operation_name: str,
+        model: str,
     ) -> tuple[int, Any]:
         retry_attempt = 1
         queue_attempt = 1
@@ -187,7 +262,7 @@ class AgnesVideoProvider:
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if retry_attempt >= self.max_retries:
                     raise
-                await self._retry_after_transient_error(progress, operation_name, retry_attempt, exc)
+                await self._retry_after_transient_error(progress, operation_name, retry_attempt, exc, model)
                 retry_attempt += 1
                 continue
             if status < 400:
@@ -196,12 +271,12 @@ class AgnesVideoProvider:
             if operation_name == "create" and _is_video_queue_full_error(error):
                 if queue_attempt >= self.queue_max_attempts:
                     raise error
-                await self._retry_after_queue_full(progress, queue_attempt)
+                await self._retry_after_queue_full(progress, queue_attempt, model)
                 queue_attempt += 1
                 continue
             if not _is_retryable_agnes_video_error(error) or retry_attempt >= self.max_retries:
                 raise error
-            await self._retry_after_transient_error(progress, operation_name, retry_attempt, error)
+            await self._retry_after_transient_error(progress, operation_name, retry_attempt, error, model)
             retry_attempt += 1
 
     async def _retry_after_transient_error(
@@ -210,13 +285,14 @@ class AgnesVideoProvider:
         operation: str,
         attempt: int,
         error: BaseException,
+        model: str,
     ) -> None:
         delay = self.retry_base_delay_seconds * (2 ** (attempt - 1))
         _emit_progress(
             progress,
             "video_retry",
             f"Agnes video {operation} failed transiently; retrying after {delay:g}s",
-            {"model": self.model, "operation": operation, "attempt": attempt, "max_attempts": self.max_retries, "error": str(error)},
+            {"model": model, "operation": operation, "attempt": attempt, "max_attempts": self.max_retries, "error": str(error)},
         )
         await asyncio.sleep(delay)
 
@@ -224,6 +300,7 @@ class AgnesVideoProvider:
         self,
         progress: Callable[[str, str, dict[str, Any]], None] | None,
         queue_attempt: int,
+        model: str,
     ) -> None:
         delay = min(
             self.queue_retry_max_delay_seconds,
@@ -240,7 +317,7 @@ class AgnesVideoProvider:
             "video_queue_wait",
             f"Agnes video queue is full; retrying submit after {delay:g}s",
             {
-                "model": self.model,
+                "model": model,
                 "operation": "create",
                 "error_code": "video_queue_full",
                 "queue_attempt": queue_attempt,
