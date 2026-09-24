@@ -1,10 +1,6 @@
 import asyncio
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
-
-from PIL import Image
 
 from agent_runtime.vimax_adapters import _build_video_generator
 from interfaces.video_output import VideoOutput
@@ -98,35 +94,40 @@ class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output.data, b"nested-video")
 
     async def test_maps_one_image_to_i2v_and_two_images_to_keyframes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            first = Path(tmp) / "first.png"
-            last = Path(tmp) / "last.png"
-            Image.new("RGB", (16, 9), "blue").save(first)
-            Image.new("RGB", (16, 9), "orange").save(last)
-            payloads = []
+        payloads = []
 
-            async def fake_post(url, *, headers, payload, timeout):
-                payloads.append(payload)
-                return 200, {"video_id": f"task-{len(payloads)}"}
+        async def fake_post(url, *, headers, payload, timeout):
+            payloads.append(payload)
+            return 200, {"video_id": f"task-{len(payloads)}"}
 
-            async def fake_get(url, *, headers, timeout):
-                return 200, {"status": "completed", "video_url": "https://cdn.example.test/result.mp4"}
+        async def fake_get(url, *, headers, timeout):
+            return 200, {"status": "completed", "metadata": {"url": "https://cdn.example.test/result.mp4"}}
 
-            async def fake_download(url, *, headers, timeout):
-                return 200, b"video"
+        async def fake_download(url, *, headers, timeout):
+            return 200, b"video"
 
-            provider = AgnesVideoProvider(api_key="test-key", poll_interval_seconds=0)
-            with patch("tools.video_generator_agnes_api._post_json", fake_post), \
-                 patch("tools.video_generator_agnes_api._get_json", fake_get), \
-                 patch("tools.video_generator_agnes_api._get_bytes", fake_download):
-                await provider.generate_single_video("A bird takes flight.", [str(first)])
-                await provider.generate_single_video("The bird reaches a distant tree.", [str(first), str(last)])
+        first = "https://images.example.test/first.png"
+        last = "https://images.example.test/last.png"
+        provider = AgnesVideoProvider(api_key="test-key", poll_interval_seconds=0)
+        with patch("tools.video_generator_agnes_api._post_json", fake_post), \
+             patch("tools.video_generator_agnes_api._get_json", fake_get), \
+             patch("tools.video_generator_agnes_api._get_bytes", fake_download):
+            await provider.generate_single_video("A bird takes flight.", [first])
+            await provider.generate_single_video("The bird reaches a distant tree.", [first, last])
 
-        self.assertEqual(payloads[0]["mode"], "img2video")
-        self.assertTrue(payloads[0]["first_frame"].startswith("data:image/png;base64,"))
-        self.assertEqual(payloads[1]["mode"], "keyframe")
-        self.assertTrue(payloads[1]["first_frame"].startswith("data:image/png;base64,"))
-        self.assertTrue(payloads[1]["last_frame"].startswith("data:image/png;base64,"))
+        self.assertEqual(payloads[0], {
+            "model": "agnes-video-v2.0",
+            "prompt": "A bird takes flight.",
+            "image": first,
+            "mode": "ti2vid",
+            "width": 1280,
+            "height": 720,
+            "num_frames": 121,
+            "frame_rate": 24,
+        })
+        self.assertEqual(payloads[1]["model"], "agnes-video-v2.0")
+        self.assertEqual(payloads[1]["extra_body"], {"image": [first, last], "mode": "keyframes"})
+        self.assertEqual(payloads[1]["num_frames"], 121)
 
     async def test_rejects_missing_api_key_without_network_request(self):
         post = AsyncMock()

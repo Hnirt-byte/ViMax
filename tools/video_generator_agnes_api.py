@@ -14,6 +14,7 @@ from utils.rate_limiter import RateLimiter
 
 DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_MODEL = "agnes-video-2.5-flash"
+DEFAULT_REFERENCE_MODEL = "agnes-video-v2.0"
 
 
 class AgnesVideoAPIError(RuntimeError):
@@ -30,6 +31,7 @@ class AgnesVideoProvider:
         self,
         api_key: str,
         model: str = DEFAULT_MODEL,
+        reference_model: str = DEFAULT_REFERENCE_MODEL,
         base_url: str = DEFAULT_BASE_URL,
         default_seconds: int = 5,
         default_aspect_ratio: str = "16:9",
@@ -43,6 +45,7 @@ class AgnesVideoProvider:
     ) -> None:
         self.api_key = api_key
         self.model = model
+        self.reference_model = reference_model
         self.base_url = base_url.rstrip("/")
         self.default_seconds = default_seconds
         self.default_aspect_ratio = default_aspect_ratio
@@ -65,56 +68,66 @@ class AgnesVideoProvider:
     ) -> VideoOutput:
         if not self.api_key:
             raise ValueError("Agnes video API key is required")
-        references = [_resolve_image_reference(path) for path in reference_image_paths or []]
+        references = list(reference_image_paths or [])
         if len(references) > 2:
             raise ValueError("Agnes video supports at most two reference images")
 
         progress = kwargs.get("progress")
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "mode": "text",
-            "seconds": str(seconds or self.default_seconds),
-            "aspect_ratio": aspect_ratio or self.default_aspect_ratio,
-            "size": kwargs.get("resolution", self.default_resolution),
-            "n": 1,
-        }
-        if kwargs.get("seed") is not None:
-            payload["seed"] = kwargs["seed"]
-        if len(references) == 1:
-            payload["mode"] = "img2video"
-            payload["first_frame"] = references[0]
-        elif len(references) == 2:
-            payload["mode"] = "keyframe"
-            payload["first_frame"] = references[0]
-            payload["last_frame"] = references[1]
-        _emit_progress(progress, "video_create", f"Creating Agnes video task with {self.model}", {"model": self.model})
+        duration = seconds or self.default_seconds
+        ratio = aspect_ratio or self.default_aspect_ratio
+        resolution = kwargs.get("resolution", self.default_resolution)
+        if references:
+            model = self.reference_model
+            payload = _build_v2_reference_payload(
+                model=model,
+                prompt=prompt,
+                references=references,
+                aspect_ratio=ratio,
+                seconds=duration,
+                resolution=resolution,
+                seed=kwargs.get("seed"),
+                negative_prompt=kwargs.get("negative_prompt"),
+            )
+        else:
+            model = self.model
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "mode": "text",
+                "seconds": str(duration),
+                "aspect_ratio": ratio,
+                "size": resolution,
+                "n": 1,
+            }
+            if kwargs.get("seed") is not None:
+                payload["seed"] = kwargs["seed"]
+        _emit_progress(progress, "video_create", f"Creating Agnes video task with {model}", {"model": model})
         _, response = await self._request_with_retry(
             lambda: self._post_json(f"{self.base_url}/videos", payload),
             progress=progress,
             operation_name="create",
         )
         task_id = _task_id_from_response(response)
-        _emit_progress(progress, "video_task_created", "Agnes video task created", {"model": self.model, "task_id": task_id})
+        _emit_progress(progress, "video_task_created", "Agnes video task created", {"model": model, "task_id": task_id})
 
         deadline = asyncio.get_running_loop().time() + self.poll_timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             _, result = await self._request_with_retry(
-                lambda: self._get_json(self._status_url(task_id)),
+                lambda: self._get_json(self._status_url(task_id, model)),
                 progress=progress,
                 operation_name="poll",
             )
             task_status = _status_from_response(result)
-            _emit_progress(progress, "video_status", f"Agnes video status: {task_status}", {"model": self.model, "task_id": task_id, "status": task_status})
+            _emit_progress(progress, "video_status", f"Agnes video status: {task_status}", {"model": model, "task_id": task_id, "status": task_status})
             if task_status.lower() in {"completed", "success", "succeeded", "done", "finished"}:
                 video_url = _video_url_from_response(result)
-                _emit_progress(progress, "video_download_start", "Downloading Agnes video output", {"model": self.model, "task_id": task_id})
+                _emit_progress(progress, "video_download_start", "Downloading Agnes video output", {"model": model, "task_id": task_id})
                 _, video_bytes = await self._request_with_retry(
                     lambda: self._get_bytes(video_url),
                     progress=progress,
                     operation_name="download",
                 )
-                _emit_progress(progress, "video_completed", "Agnes video generation completed", {"model": self.model, "task_id": task_id})
+                _emit_progress(progress, "video_completed", "Agnes video generation completed", {"model": model, "task_id": task_id})
                 return VideoOutput(fmt="bytes", ext="mp4", data=video_bytes)
             if task_status.lower() in {"failed", "error", "cancelled", "canceled", "expired"}:
                 raise RuntimeError(f"Agnes video task {task_id} failed: {result}")
@@ -180,9 +193,9 @@ class AgnesVideoProvider:
     def _timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(total=self.request_timeout_seconds)
 
-    def _status_url(self, video_id: str) -> str:
+    def _status_url(self, video_id: str, model: str) -> str:
         api_root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
-        return f"{api_root}/agnesapi?{urlencode({'video_id': video_id, 'model_name': self.model})}"
+        return f"{api_root}/agnesapi?{urlencode({'video_id': video_id, 'model_name': model})}"
 
 
 def _task_id_from_response(response: Any) -> str:
@@ -212,7 +225,11 @@ def _video_url_from_response(response: Any) -> str:
         raise ValueError(f"Agnes video completion response must be an object: {response}")
     raw_data = response.get("data")
     data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
-    for value in (response.get("video_url"), response.get("url"), response.get("output_url"), data.get("video_url"), data.get("url")):
+    raw_metadata = response.get("metadata")
+    metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    raw_data_metadata = data.get("metadata")
+    data_metadata: dict[str, Any] = raw_data_metadata if isinstance(raw_data_metadata, dict) else {}
+    for value in (response.get("video_url"), response.get("url"), response.get("output_url"), data.get("video_url"), data.get("url"), metadata.get("url"), data_metadata.get("url")):
         if isinstance(value, str) and value:
             return value
     raise ValueError(f"Agnes video completion response missing video URL: {response}")
@@ -224,10 +241,64 @@ def _is_retryable_agnes_video_error(exc: BaseException) -> bool:
     return isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
 
 
-def _resolve_image_reference(reference: str) -> str:
-    if reference.startswith(("http://", "https://", "data:")):
+def _build_v2_reference_payload(
+    *,
+    model: str,
+    prompt: str,
+    references: Sequence[str],
+    aspect_ratio: str,
+    seconds: int,
+    resolution: str,
+    seed: Any,
+    negative_prompt: Any,
+) -> dict[str, Any]:
+    width, height = _v2_dimensions(aspect_ratio, resolution)
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "num_frames": _v2_num_frames(seconds),
+        "frame_rate": 24,
+    }
+    if len(references) == 1:
+        payload["image"] = _public_image_url(references[0])
+        payload["mode"] = "ti2vid"
+    else:
+        payload["extra_body"] = {"image": [_public_image_url(reference) for reference in references], "mode": "keyframes"}
+    if seed is not None:
+        payload["seed"] = seed
+    if isinstance(negative_prompt, str) and negative_prompt:
+        payload["negative_prompt"] = negative_prompt
+    return payload
+
+
+def _public_image_url(reference: str) -> str:
+    if reference.startswith(("http://", "https://")):
         return reference
-    return image_path_to_b64(reference, mime=True)
+    raise ValueError("Agnes Video v2.0 image references must be publicly accessible http(s) URLs")
+
+
+def _v2_num_frames(seconds: int) -> int:
+    target = max(9, round(seconds * 24))
+    return min(441, max(9, round((target - 1) / 8) * 8 + 1))
+
+
+def _v2_dimensions(aspect_ratio: str, resolution: str) -> tuple[int, int]:
+    normalized_resolution = str(resolution).upper().removesuffix("P")
+    try:
+        short_edge = int(normalized_resolution)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported Agnes Video v2.0 resolution: {resolution}") from exc
+    if short_edge not in {480, 720, 1080}:
+        raise ValueError(f"Unsupported Agnes Video v2.0 resolution: {resolution}")
+    ratios = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4)}
+    if aspect_ratio not in ratios:
+        raise ValueError(f"Unsupported Agnes Video v2.0 aspect ratio: {aspect_ratio}")
+    horizontal, vertical = ratios[aspect_ratio]
+    if horizontal >= vertical:
+        return round(short_edge * horizontal / vertical), short_edge
+    return short_edge, round(short_edge * vertical / horizontal)
 
 
 def _emit_progress(progress: Callable[[str, str, dict[str, Any]], None] | None, stage: str, message: str, metadata: dict[str, Any]) -> None:
