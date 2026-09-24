@@ -116,18 +116,19 @@ class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
             await provider.generate_single_video("The bird reaches a distant tree.", [first, last])
 
         self.assertEqual(payloads[0], {
-            "model": "agnes-video-v2.0",
+            "model": "agnes-video-2.5-flash",
             "prompt": "A bird takes flight.",
-            "image": first,
-            "mode": "ti2vid",
-            "width": 1280,
-            "height": 720,
-            "num_frames": 121,
-            "frame_rate": 24,
+            "mode": "keyframe",
+            "seconds": "5",
+            "size": "720P",
+            "aspect_ratio": "16:9",
+            "first_frame": first,
+            "n": 1,
         })
-        self.assertEqual(payloads[1]["model"], "agnes-video-v2.0")
-        self.assertEqual(payloads[1]["extra_body"], {"image": [first, last], "mode": "keyframes"})
-        self.assertEqual(payloads[1]["num_frames"], 121)
+        self.assertEqual(payloads[1]["model"], "agnes-video-2.5-flash")
+        self.assertEqual(payloads[1]["mode"], "keyframe")
+        self.assertEqual(payloads[1]["first_frame"], first)
+        self.assertEqual(payloads[1]["last_frame"], last)
 
     async def test_rejects_missing_api_key_without_network_request(self):
         post = AsyncMock()

@@ -14,6 +14,7 @@ from utils.rate_limiter import RateLimiter
 
 DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_MODEL = "agnes-video-2.5-flash"
+# Deprecated compatibility path. New reference jobs use the configured 2.5 model.
 DEFAULT_REFERENCE_MODEL = "agnes-video-v2.0"
 
 
@@ -25,7 +26,7 @@ class AgnesVideoAPIError(RuntimeError):
 
 
 class AgnesVideoProvider:
-    """Async Agnes Video provider for submit, polling, and media download."""
+    """Async Agnes Video provider; v2.0 reference support is explicit legacy compatibility."""
 
     def __init__(
         self,
@@ -45,7 +46,7 @@ class AgnesVideoProvider:
     ) -> None:
         self.api_key = api_key
         self.model = model
-        self.reference_model = reference_model
+        self.reference_model = reference_model  # Deprecated v2.0 compatibility model.
         self.base_url = base_url.rstrip("/")
         self.default_seconds = default_seconds
         self.default_aspect_ratio = default_aspect_ratio
@@ -77,17 +78,29 @@ class AgnesVideoProvider:
         ratio = aspect_ratio or self.default_aspect_ratio
         resolution = kwargs.get("resolution", self.default_resolution)
         if references:
-            model = self.reference_model
-            payload = _build_v2_reference_payload(
-                model=model,
-                prompt=prompt,
-                references=references,
-                aspect_ratio=ratio,
-                seconds=duration,
-                resolution=resolution,
-                seed=kwargs.get("seed"),
-                negative_prompt=kwargs.get("negative_prompt"),
-            )
+            if self.model == self.reference_model:
+                model = self.reference_model
+                payload = _build_v2_reference_payload(
+                    model=model,
+                    prompt=prompt,
+                    references=references,
+                    aspect_ratio=ratio,
+                    seconds=duration,
+                    resolution=resolution,
+                    seed=kwargs.get("seed"),
+                    negative_prompt=kwargs.get("negative_prompt"),
+                )
+            else:
+                model = self.model
+                payload = _build_25_keyframe_payload(
+                    model=model,
+                    prompt=prompt,
+                    references=references,
+                    aspect_ratio=ratio,
+                    seconds=duration,
+                    resolution=resolution,
+                    seed=kwargs.get("seed"),
+                )
         else:
             model = self.model
             payload = {
@@ -270,6 +283,33 @@ def _build_v2_reference_payload(
         payload["seed"] = seed
     if isinstance(negative_prompt, str) and negative_prompt:
         payload["negative_prompt"] = negative_prompt
+    return payload
+
+
+def _build_25_keyframe_payload(
+    *,
+    model: str,
+    prompt: str,
+    references: Sequence[str],
+    aspect_ratio: str,
+    seconds: int,
+    resolution: str,
+    seed: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "mode": "keyframe",
+        "seconds": str(seconds),
+        "size": resolution,
+        "aspect_ratio": aspect_ratio,
+        "first_frame": _public_image_url(references[0]),
+        "n": 1,
+    }
+    if len(references) == 2:
+        payload["last_frame"] = _public_image_url(references[1])
+    if seed is not None:
+        payload["seed"] = seed
     return payload
 
 
