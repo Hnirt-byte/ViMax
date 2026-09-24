@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any, Callable, Sequence
 from urllib.parse import urlencode
 
@@ -16,6 +17,7 @@ DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_MODEL = "agnes-video-2.5-flash"
 # Deprecated compatibility path. New reference jobs use the configured 2.5 model.
 DEFAULT_REFERENCE_MODEL = "agnes-video-v2.0"
+logger = logging.getLogger(__name__)
 
 
 class AgnesVideoAPIError(RuntimeError):
@@ -42,6 +44,10 @@ class AgnesVideoProvider:
         poll_interval_seconds: float = 5.0,
         max_retries: int = 3,
         retry_base_delay_seconds: float = 1.0,
+        queue_max_attempts: int = 3,
+        queue_retry_base_delay_seconds: float = 30.0,
+        queue_retry_max_delay_seconds: float = 300.0,
+        queue_retry_multiplier: float = 2.0,
         rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.api_key = api_key
@@ -57,6 +63,10 @@ class AgnesVideoProvider:
         self.poll_interval_seconds = max(0.0, poll_interval_seconds)
         self.max_retries = max(1, max_retries)
         self.retry_base_delay_seconds = max(0.0, retry_base_delay_seconds)
+        self.queue_max_attempts = max(1, queue_max_attempts)
+        self.queue_retry_base_delay_seconds = max(0.0, queue_retry_base_delay_seconds)
+        self.queue_retry_max_delay_seconds = max(self.queue_retry_base_delay_seconds, queue_retry_max_delay_seconds)
+        self.queue_retry_multiplier = max(1.0, queue_retry_multiplier)
         self.rate_limiter = rate_limiter
 
     async def generate_single_video(
@@ -168,21 +178,30 @@ class AgnesVideoProvider:
         progress: Callable[[str, str, dict[str, Any]], None] | None,
         operation_name: str,
     ) -> tuple[int, Any]:
-        for attempt in range(1, self.max_retries + 1):
+        retry_attempt = 1
+        queue_attempt = 1
+        while True:
             try:
                 status, payload = await request()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt >= self.max_retries:
+                if retry_attempt >= self.max_retries:
                     raise
-                await self._retry_after_transient_error(progress, operation_name, attempt, exc)
+                await self._retry_after_transient_error(progress, operation_name, retry_attempt, exc)
+                retry_attempt += 1
                 continue
             if status < 400:
                 return status, payload
             error = AgnesVideoAPIError(status, payload)
-            if not _is_retryable_agnes_video_error(error) or attempt >= self.max_retries:
+            if operation_name == "create" and _is_video_queue_full_error(error):
+                if queue_attempt >= self.queue_max_attempts:
+                    raise error
+                await self._retry_after_queue_full(progress, queue_attempt)
+                queue_attempt += 1
+                continue
+            if not _is_retryable_agnes_video_error(error) or retry_attempt >= self.max_retries:
                 raise error
-            await self._retry_after_transient_error(progress, operation_name, attempt, error)
-        raise RuntimeError(f"Agnes video {operation_name} exhausted retries")
+            await self._retry_after_transient_error(progress, operation_name, retry_attempt, error)
+            retry_attempt += 1
 
     async def _retry_after_transient_error(
         self,
@@ -197,6 +216,36 @@ class AgnesVideoProvider:
             "video_retry",
             f"Agnes video {operation} failed transiently; retrying after {delay:g}s",
             {"model": self.model, "operation": operation, "attempt": attempt, "max_attempts": self.max_retries, "error": str(error)},
+        )
+        await asyncio.sleep(delay)
+
+    async def _retry_after_queue_full(
+        self,
+        progress: Callable[[str, str, dict[str, Any]], None] | None,
+        queue_attempt: int,
+    ) -> None:
+        delay = min(
+            self.queue_retry_max_delay_seconds,
+            self.queue_retry_base_delay_seconds * (self.queue_retry_multiplier ** (queue_attempt - 1)),
+        )
+        logger.warning(
+            "Agnes video queue full; waiting %.1fs before submit retry %d/%d",
+            delay,
+            queue_attempt + 1,
+            self.queue_max_attempts,
+        )
+        _emit_progress(
+            progress,
+            "video_queue_wait",
+            f"Agnes video queue is full; retrying submit after {delay:g}s",
+            {
+                "model": self.model,
+                "operation": "create",
+                "error_code": "video_queue_full",
+                "queue_attempt": queue_attempt,
+                "max_attempts": self.queue_max_attempts,
+                "delay_seconds": delay,
+            },
         )
         await asyncio.sleep(delay)
 
@@ -252,6 +301,15 @@ def _is_retryable_agnes_video_error(exc: BaseException) -> bool:
     if isinstance(exc, AgnesVideoAPIError):
         return exc.status_code == 429 or exc.status_code >= 500
     return isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
+
+
+def _is_video_queue_full_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, AgnesVideoAPIError)
+        and exc.status_code == 503
+        and isinstance(exc.payload, dict)
+        and exc.payload.get("code") == "video_queue_full"
+    )
 
 
 def _build_v2_reference_payload(
