@@ -17,10 +17,12 @@ class ImageOutput:
         fmt: Literal["b64", "url", "pil", "np"],
         ext: str,
         data: Union[str, Image.Image],
+        source_url: Optional[str] = None,
     ):
         self.fmt = fmt
         self.ext = ext
         self.data = data
+        self.source_url = source_url if source_url is not None else (data if fmt == "url" and isinstance(data, str) else None)
 
 
     def save_b64(self, path: str) -> None:
@@ -59,3 +61,5 @@ class ImageOutput:
     def save(self, path: str) -> None:
         save_func = getattr(self, f"save_{self.fmt}")
         save_func(path)
+        from utils.image_reference import persist_public_source_url
+        persist_public_source_url(path, self.source_url)

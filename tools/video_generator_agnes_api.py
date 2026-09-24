@@ -10,6 +10,7 @@ import aiohttp
 
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
+from utils.image_reference import public_source_url_for_image
 from utils.rate_limiter import RateLimiter
 
 
@@ -333,10 +334,10 @@ def _build_v2_reference_payload(
         "frame_rate": 24,
     }
     if len(references) == 1:
-        payload["image"] = _public_image_url(references[0])
+        payload["image"] = _public_image_url(references[0], model)
         payload["mode"] = "ti2vid"
     else:
-        payload["extra_body"] = {"image": [_public_image_url(reference) for reference in references], "mode": "keyframes"}
+        payload["extra_body"] = {"image": [_public_image_url(reference, model) for reference in references], "mode": "keyframes"}
     if seed is not None:
         payload["seed"] = seed
     if isinstance(negative_prompt, str) and negative_prompt:
@@ -361,20 +362,24 @@ def _build_25_keyframe_payload(
         "seconds": str(seconds),
         "size": resolution,
         "aspect_ratio": aspect_ratio,
-        "first_frame": _public_image_url(references[0]),
+        "first_frame": _public_image_url(references[0], model),
         "n": 1,
     }
     if len(references) == 2:
-        payload["last_frame"] = _public_image_url(references[1])
+        payload["last_frame"] = _public_image_url(references[1], model)
     if seed is not None:
         payload["seed"] = seed
     return payload
 
 
-def _public_image_url(reference: str) -> str:
-    if reference.startswith(("http://", "https://")):
-        return reference
-    raise ValueError("Agnes Video v2.0 image references must be publicly accessible http(s) URLs")
+def _public_image_url(reference: str, model: str) -> str:
+    source_url = public_source_url_for_image(reference)
+    if source_url is not None:
+        return source_url
+    raise ValueError(
+        f"Agnes Video {model} image references must be publicly accessible http(s) URLs; "
+        "local files require a persisted source_url sidecar"
+    )
 
 
 def _v2_num_frames(seconds: int) -> int:

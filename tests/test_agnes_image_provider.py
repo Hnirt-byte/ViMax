@@ -47,6 +47,7 @@ class AgnesImageProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.fmt, "url")
         self.assertEqual(result.ext, "webp")
         self.assertEqual(result.data, "https://cdn.example.test/image.webp")
+        self.assertEqual(result.source_url, "https://cdn.example.test/image.webp")
         self.assertEqual([item[0] for item in progress], ["image_generation", "image_completed"])
 
     async def test_transmits_explicit_portrait_image_size(self):
