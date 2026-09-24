@@ -8,6 +8,10 @@ from tools.video_generator_agnes_api import AgnesVideoAPIError, AgnesVideoProvid
 
 
 class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_poll_interval_is_conservative(self):
+        provider = AgnesVideoProvider(api_key="test-key")
+        self.assertGreaterEqual(provider.poll_interval_seconds, 10)
+
     async def test_generates_short_text_video_and_downloads_result(self):
         captured = {}
         limiter = AsyncMock()

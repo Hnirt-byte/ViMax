@@ -41,7 +41,7 @@ class AgnesVideoProvider:
         default_resolution: str = "720P",
         request_timeout_seconds: float = 60.0,
         poll_timeout_seconds: float = 900.0,
-        poll_interval_seconds: float = 5.0,
+        poll_interval_seconds: float = 10.0,
         max_retries: int = 3,
         retry_base_delay_seconds: float = 1.0,
         queue_max_attempts: int = 3,
