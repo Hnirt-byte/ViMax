@@ -83,6 +83,8 @@ class Idea2VideoPipeline:
         characters: List[CharacterInScene],
         character_portraits_registry: Optional[Dict[str, Dict[str, Dict[str, str]]]],
         style: str,
+        reference_views: Optional[List[str]] = None,
+        image_size: Optional[str] = None,
     ):
         character_portraits_registry_path = os.path.join(
             self.working_dir, "character_portraits_registry.json")
@@ -93,10 +95,11 @@ class Idea2VideoPipeline:
             else:
                 character_portraits_registry = {}
 
+        requested_views = _normalize_reference_views(reference_views)
         tasks = [
-            self.generate_portraits_for_single_character(character, style)
+            self.generate_portraits_for_single_character(character, style, requested_views, image_size)
             for character in characters
-            if character.identifier_in_scene not in character_portraits_registry
+            if not _registry_has_views(character_portraits_registry.get(character.identifier_in_scene), requested_views)
             # Characters never shown on screen (e.g. a voice or chat-only
             # character) have no physical description, so asking the image
             # model for front/side/back portraits of them is nonsensical and
@@ -105,7 +108,9 @@ class Idea2VideoPipeline:
         ]
         if tasks:
             for future in asyncio.as_completed(tasks):
-                character_portraits_registry.update(await future)
+                generated = await future
+                for identifier, views in generated.items():
+                    character_portraits_registry.setdefault(identifier, {}).update(views)
                 with open(character_portraits_registry_path, 'w', encoding='utf-8') as f:
                     json.dump(character_portraits_registry,
                               f, ensure_ascii=False, indent=4)
@@ -161,6 +166,8 @@ class Idea2VideoPipeline:
         self,
         character: CharacterInScene,
         style: str,
+        reference_views: List[str],
+        image_size: Optional[str],
     ):
         character_dir = os.path.join(
             self.working_dir, "character_portraits", f"{character.idx}_{safe_path_component(character.identifier_in_scene)}")
@@ -170,56 +177,45 @@ class Idea2VideoPipeline:
         if os.path.exists(front_portrait_path):
             pass
         else:
-            front_portrait_output = await self.character_portraits_generator.generate_front_portrait(character, style)
+            front_portrait_output = await self.character_portraits_generator.generate_front_portrait(character, style, image_size=image_size)
             front_portrait_output.save(front_portrait_path)
 
-        side_portrait_path = os.path.join(character_dir, "side.png")
-        if os.path.exists(side_portrait_path):
-            pass
-        else:
-            try:
-                side_portrait_output = await self.character_portraits_generator.generate_side_portrait(character, front_portrait_path)
-                side_portrait_output.save(side_portrait_path)
-            except Exception as e:
-                # gemini-2.5-flash-image intermittently (sometimes beyond
-                # the tenacity retry budget) fails this front->side
-                # re-angling edit with finish_reason=IMAGE_OTHER / empty
-                # content. Fall back to the front portrait rather than
-                # aborting the whole pipeline.
-                print(f"⚠️ Side portrait generation failed for {character.identifier_in_scene} after retries ({e}); reusing front portrait as fallback.")
-                shutil.copy(front_portrait_path, side_portrait_path)
+        portrait_paths = {"front": front_portrait_path}
+        if "side" in reference_views:
+            side_portrait_path = os.path.join(character_dir, "side.png")
+            if not os.path.exists(side_portrait_path):
+                try:
+                    side_portrait_output = await self.character_portraits_generator.generate_side_portrait(character, front_portrait_path, image_size=image_size)
+                    side_portrait_output.save(side_portrait_path)
+                except Exception as exc:
+                    print(f"⚠️ Side portrait generation failed for {character.identifier_in_scene} after retries ({exc}); reusing front portrait as fallback.")
+                    shutil.copy(front_portrait_path, side_portrait_path)
+            portrait_paths["side"] = side_portrait_path
 
-        back_portrait_path = os.path.join(character_dir, "back.png")
-        if os.path.exists(back_portrait_path):
-            pass
-        else:
-            try:
-                back_portrait_output = await self.character_portraits_generator.generate_back_portrait(character, front_portrait_path)
-                back_portrait_output.save(back_portrait_path)
-            except Exception as e:
-                print(f"⚠️ Back portrait generation failed for {character.identifier_in_scene} after retries ({e}); reusing front portrait as fallback.")
-                shutil.copy(front_portrait_path, back_portrait_path)
+        if "back" in reference_views:
+            back_portrait_path = os.path.join(character_dir, "back.png")
+            if not os.path.exists(back_portrait_path):
+                try:
+                    back_portrait_output = await self.character_portraits_generator.generate_back_portrait(character, front_portrait_path, image_size=image_size)
+                    back_portrait_output.save(back_portrait_path)
+                except Exception as exc:
+                    print(f"⚠️ Back portrait generation failed for {character.identifier_in_scene} after retries ({exc}); reusing front portrait as fallback.")
+                    shutil.copy(front_portrait_path, back_portrait_path)
+            portrait_paths["back"] = back_portrait_path
 
         print(
             f"☑️ Completed character portrait generation for {character.identifier_in_scene}.")
 
         return {
             character.identifier_in_scene: {
-                "front": {
-                    "path": front_portrait_path,
-                    "description": f"A front view portrait of {character.identifier_in_scene}.",
-                },
-                "side": {
-                    "path": side_portrait_path,
-                    "description": f"A side view portrait of {character.identifier_in_scene}.",
-                },
-                "back": {
-                    "path": back_portrait_path,
-                    "description": f"A back view portrait of {character.identifier_in_scene}.",
-                },
+                view: {
+                    "path": path,
+                    "description": f"A {view} view portrait of {character.identifier_in_scene}.",
+                }
+                for view, path in portrait_paths.items()
+                if view in reference_views
             }
         }
-
     async def __call__(
         self,
         idea: str,
@@ -269,3 +265,15 @@ class Idea2VideoPipeline:
             concatenate_video_files(all_video_paths, final_video_path)
             _pipeline_print(quiet, f"☑️ Concatenated videos, saved to {final_video_path}.")
         return final_video_path
+
+
+def _normalize_reference_views(reference_views: Optional[List[str]]) -> List[str]:
+    views = reference_views or ["front", "side", "back"]
+    allowed = {"front", "side", "back"}
+    if not isinstance(views, list) or not views or any(view not in allowed for view in views) or len(set(views)) != len(views):
+        raise ValueError("reference_views must be a non-empty list of unique front, side, and/or back values")
+    return views
+
+
+def _registry_has_views(registry_item: Optional[Dict[str, Dict[str, str]]], requested_views: List[str]) -> bool:
+    return isinstance(registry_item, dict) and all(view in registry_item for view in requested_views)

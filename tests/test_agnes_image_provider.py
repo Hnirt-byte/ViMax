@@ -49,6 +49,14 @@ class AgnesImageProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data, "https://cdn.example.test/image.webp")
         self.assertEqual([item[0] for item in progress], ["image_generation", "image_completed"])
 
+    async def test_transmits_explicit_portrait_image_size(self):
+        post = AsyncMock(return_value=(200, {"data": [{"url": "https://cdn.example.test/image.webp"}]}))
+        provider = AgnesImageProvider(api_key="test-key")
+        with patch("tools.image_generator_agnes_api._post_json", post):
+            await provider.generate_single_image("portrait first frame", size="720x1280")
+
+        self.assertEqual(post.await_args.kwargs["payload"]["size"], "720x1280")
+
     async def test_supports_local_and_url_image_references_and_base64_response(self):
         with tempfile.TemporaryDirectory() as tmp:
             reference_path = Path(tmp) / "reference.png"

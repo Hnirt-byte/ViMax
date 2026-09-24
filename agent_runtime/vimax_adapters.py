@@ -488,6 +488,7 @@ class ViMaxAdapters:
             if not characters_path.exists():
                 characters_path = idea_dir / "characters.json"
             characters = _load_characters(characters_path)
+            render_options, reference_views = _load_idea_render_plan(idea_dir / "render_plan.json")
 
             self.session_index.update_stage(session_id, "scene_rendering", f"Rendering {scene_id}")
             payload = {
@@ -515,6 +516,8 @@ class ViMaxAdapters:
                     characters=characters,
                     character_portraits_registry=None,
                     style=str(session.get("style", "")),
+                    reference_views=reference_views,
+                    image_size=render_options.get("image_size"),
                 )
                 pipeline = Script2VideoPipeline(
                     chat_model=chat_model,
@@ -530,6 +533,7 @@ class ViMaxAdapters:
                     character_portraits_registry=character_portraits_registry,
                     quiet=True,
                     progress=_pipeline_progress(runtime, session_id, scene_index=_idea_scene_index(scene_id)),
+                    render_options=render_options,
                 )
 
             self.session_index.update_stage(session_id, "scene_rendered", f"Rendered {scene_id}")
@@ -885,6 +889,51 @@ def _load_script_text(working_dir: Path) -> str:
     if story.exists():
         return story.read_text(encoding="utf-8")
     return ""
+
+
+def _load_idea_render_plan(render_plan_path: Path) -> tuple[dict[str, Any], list[str] | None]:
+    """Load optional scene render controls without changing legacy sessions."""
+    if not render_plan_path.exists():
+        return {}, None
+    try:
+        raw = json.loads(render_plan_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid render_plan.json: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("render_plan.json must contain an object")
+    target = raw.get("target", {})
+    if not isinstance(target, dict):
+        raise ValueError("render_plan.json target must contain an object")
+
+    options: dict[str, Any] = {}
+    field_mapping = {
+        "aspect_ratio": "aspect_ratio",
+        "resolution": "resolution",
+        "duration_seconds_per_scene": "seconds",
+        "image_size": "image_size",
+    }
+    for plan_key, option_key in field_mapping.items():
+        value = target.get(plan_key)
+        if value is not None and str(value).strip():
+            options[option_key] = value
+    if "seconds" in options:
+        try:
+            options["seconds"] = int(options["seconds"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("render_plan.json duration_seconds_per_scene must be an integer") from exc
+        if options["seconds"] <= 0:
+            raise ValueError("render_plan.json duration_seconds_per_scene must be positive")
+
+    requested_views = raw.get("shared_character_reference_views")
+    if requested_views is None:
+        return options, None
+    if not isinstance(requested_views, list) or not requested_views:
+        raise ValueError("render_plan.json shared_character_reference_views must be a non-empty list")
+    allowed_views = {"front", "side", "back"}
+    reference_views = [str(view) for view in requested_views]
+    if any(view not in allowed_views for view in reference_views) or len(set(reference_views)) != len(reference_views):
+        raise ValueError("render_plan.json shared_character_reference_views must contain unique front, side, and/or back values")
+    return options, reference_views
 
 
 def _is_valid_idea_scene_id(scene_id: str) -> bool:

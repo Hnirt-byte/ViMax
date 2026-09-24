@@ -130,6 +130,27 @@ class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payloads[1]["first_frame"], first)
         self.assertEqual(payloads[1]["last_frame"], last)
 
+    async def test_transmits_explicit_portrait_render_settings(self):
+        post = AsyncMock(return_value=(200, {"video_id": "task-portrait"}))
+        get = AsyncMock(return_value=(200, {"status": "completed", "url": "https://cdn.example.test/result.mp4"}))
+        download = AsyncMock(return_value=(200, b"video"))
+        provider = AgnesVideoProvider(api_key="test-key", poll_interval_seconds=0)
+        with patch("tools.video_generator_agnes_api._post_json", post), \
+             patch("tools.video_generator_agnes_api._get_json", get), \
+             patch("tools.video_generator_agnes_api._get_bytes", download):
+            await provider.generate_single_video(
+                "A red paper airplane rises through a warm sunset sky.",
+                ["https://images.example.test/portrait-first-frame.png"],
+                aspect_ratio="9:16",
+                resolution="720P",
+                seconds=5,
+            )
+
+        payload = post.await_args.kwargs["payload"]
+        self.assertEqual(payload["aspect_ratio"], "9:16")
+        self.assertEqual(payload["size"], "720P")
+        self.assertEqual(payload["seconds"], "5")
+
     async def test_rejects_missing_api_key_without_network_request(self):
         post = AsyncMock()
         provider = AgnesVideoProvider(api_key="")

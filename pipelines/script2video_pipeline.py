@@ -201,7 +201,9 @@ class Script2VideoPipeline:
         character_portraits_registry: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
         quiet: bool = False,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+        render_options: Optional[Dict[str, Any]] = None,
     ):
+        render_options = _normalize_render_options(render_options)
         _emit_render_progress(progress, "render_start", "Starting script2video render")
         if characters is None:
             _emit_render_progress(progress, "extract_characters", "Extracting characters before render")
@@ -285,6 +287,7 @@ class Script2VideoPipeline:
                 character_portraits_registry=character_portraits_registry,
                 priority_shot_idxs=priority_shot_idxs,
                 progress=progress,
+                image_size=render_options["image_size"],
             )
             for camera in camera_tree
         ]
@@ -294,6 +297,7 @@ class Script2VideoPipeline:
             self.generate_video_for_single_shot(
                 shot_description=shot_description,
                 progress=progress,
+                render_options=render_options,
             )
             for shot_description in shot_descriptions
         ]
@@ -328,6 +332,7 @@ class Script2VideoPipeline:
         character_portraits_registry: Dict[str, Dict[str, Dict[str, str]]],
         priority_shot_idxs: List[int],
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+        image_size: str = "1600x900",
     ):
         # 1. generate the first_frame of the first shot of the camera
         first_shot_idx = camera.active_shot_idxs[0]
@@ -424,7 +429,7 @@ class Script2VideoPipeline:
                 ff_image: ImageOutput = await self.image_generator.generate_single_image(
                     prompt=prompt,
                     reference_image_paths=reference_image_paths,
-                    size="1600x900",
+                    size=image_size,
                 )
                 ff_image.save(first_shot_ff_path)
                 self.frame_events[first_shot_idx]["first_frame"].set()
@@ -450,6 +455,7 @@ class Script2VideoPipeline:
                 visible_characters=[characters[idx] for idx in shot_descriptions[first_shot_idx].lf_vis_char_idxs],
                 character_portraits_registry=character_portraits_registry,
                 progress=progress,
+                image_size=image_size,
             )
             normal_tasks.append(task)
 
@@ -462,6 +468,7 @@ class Script2VideoPipeline:
                     visible_characters=[characters[idx] for idx in shot_descriptions[shot_idx].ff_vis_char_idxs],
                     character_portraits_registry=character_portraits_registry,
                     progress=progress,
+                    image_size=image_size,
                 )
             if shot_idx in priority_shot_idxs:
                 priority_tasks.append(first_frame_task)
@@ -478,6 +485,7 @@ class Script2VideoPipeline:
                     visible_characters=[characters[idx] for idx in shot_descriptions[shot_idx].lf_vis_char_idxs],
                     character_portraits_registry=character_portraits_registry,
                     progress=progress,
+                    image_size=image_size,
                 )
                 normal_tasks.append(last_frame_task)
 
@@ -492,6 +500,7 @@ class Script2VideoPipeline:
         self,
         shot_description: ShotDescription,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+        render_options: Optional[Dict[str, Any]] = None,
     ):
         video_path = os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video.mp4")
         if os.path.exists(video_path):
@@ -510,10 +519,17 @@ class Script2VideoPipeline:
 
             print(f"🎬 Starting video generation for shot {shot_description.idx}...")
             _emit_render_progress(progress, "video_clip_start", f"Generating video clip for shot {shot_description.idx}", {"shot_idx": shot_description.idx, "frame_count": len(frame_paths)})
+            video_kwargs = {
+                "prompt": shot_description.motion_desc + "\n" + shot_description.audio_desc,
+                "reference_image_paths": frame_paths,
+                "progress": _scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
+            }
+            for option_name in ("aspect_ratio", "resolution", "seconds"):
+                value = (render_options or {}).get(option_name)
+                if value is not None:
+                    video_kwargs[option_name] = value
             video_output = await self.video_generator.generate_single_video(
-                prompt=shot_description.motion_desc + "\n" + shot_description.audio_desc,
-                reference_image_paths=frame_paths,
-                progress=_scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
+                **video_kwargs,
             )
             video_output.save(video_path)
             print(f"☑️ Generated video for shot {shot_description.idx}, saved to {video_path}.")
@@ -528,6 +544,7 @@ class Script2VideoPipeline:
         visible_characters: List[CharacterInScene],
         character_portraits_registry: Dict[str, Dict[str, Dict[str, str]]],
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+        image_size: str = "1600x900",
     ) -> ImageOutput:
 
         frame_image_path = os.path.join(self.working_dir, "shots", f"{shot_idx}", f"{frame_type}.png")
@@ -576,7 +593,7 @@ class Script2VideoPipeline:
             frame_image: ImageOutput = await self.image_generator.generate_single_image(
                 prompt=prompt,
                 reference_image_paths=reference_image_paths,
-                size="1600x900",
+                size=image_size,
             )
             frame_image.save(frame_image_path)
             print(f"☑️ Generated {frame_type} frame for shot {shot_idx}, saved to {frame_image_path}.")
@@ -585,8 +602,6 @@ class Script2VideoPipeline:
 
         self.frame_events[shot_idx][frame_type].set()
         return frame_image_path
-
-
     async def construct_camera_tree(
         self,
         shot_descriptions: List[ShotDescription],
@@ -820,3 +835,11 @@ class Script2VideoPipeline:
             }
 
         return shot_description
+
+
+def _normalize_render_options(render_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Use supplied dimensions when present while preserving legacy frame sizing."""
+    options = dict(render_options or {})
+    image_size = options.get("image_size")
+    options["image_size"] = str(image_size) if image_size else "1600x900"
+    return options

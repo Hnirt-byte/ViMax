@@ -72,8 +72,8 @@ class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
 class SceneRenderIdeaPipeline(FakeIdeaPipeline):
     portrait_calls = []
 
-    async def generate_character_portraits(self, characters, character_portraits_registry, style, progress=None):
-        self.__class__.portrait_calls.append({"working_dir": self.working_dir, "characters": characters, "style": style})
+    async def generate_character_portraits(self, characters, character_portraits_registry, style, reference_views=None, image_size=None, progress=None):
+        self.__class__.portrait_calls.append({"working_dir": self.working_dir, "characters": characters, "style": style, "reference_views": reference_views, "image_size": image_size})
         return character_portraits_registry or {}
 
 
@@ -84,7 +84,7 @@ class SceneRenderScriptPipeline:
         self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
-    async def __call__(self, script, user_requirement, style, characters=None, character_portraits_registry=None, quiet=False, progress=None):
+    async def __call__(self, script, user_requirement, style, characters=None, character_portraits_registry=None, quiet=False, progress=None, render_options=None):
         self.__class__.render_calls.append({
             "working_dir": self.working_dir,
             "script": script,
@@ -92,6 +92,7 @@ class SceneRenderScriptPipeline:
             "style": style,
             "characters": characters,
             "character_portraits_registry": character_portraits_registry,
+            "render_options": render_options,
         })
         final = self.working_dir / "final_video.mp4"
         final.write_text("scene-video", encoding="utf-8")
@@ -544,3 +545,43 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.metadata["render_cached"])
             self.assertFalse(result.metadata["render_started"])
             self.assertEqual(result.metadata["scene_video_path"], f"{record['working_dir']}/idea2video/scene_0/final_video.mp4")
+
+    async def test_render_scene_forwards_render_plan_to_portraits_and_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane", user_requirement="vertical", style="cinematic")
+            idea_dir = Path(tmp) / record["working_dir"] / "idea2video"
+            scene_dir = idea_dir / "scene_0" / "shots" / "0"
+            scene_dir.mkdir(parents=True, exist_ok=True)
+            (idea_dir / "characters.json").write_text("[]", encoding="utf-8")
+            (idea_dir / "script.json").write_text(json.dumps(["scene zero"]), encoding="utf-8")
+            (scene_dir.parent.parent / "storyboard.json").write_text("[]", encoding="utf-8")
+            (scene_dir.parent.parent / "camera_tree.json").write_text("[]", encoding="utf-8")
+            (scene_dir / "shot_description.json").write_text("{}", encoding="utf-8")
+            (idea_dir / "render_plan.json").write_text(json.dumps({
+                "target": {
+                    "aspect_ratio": "9:16",
+                    "resolution": "720P",
+                    "duration_seconds_per_scene": 5,
+                    "image_size": "720x1280",
+                },
+                "shared_character_reference_views": ["front"],
+            }), encoding="utf-8")
+            SceneRenderIdeaPipeline.portrait_calls = []
+            SceneRenderScriptPipeline.render_calls = []
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", SceneRenderIdeaPipeline), \
+                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", SceneRenderScriptPipeline):
+                result = await adapter.vimax_render_scene({"session_id": record["session_id"], "scene_id": "scene_0"})
+            self.assertTrue(result.ok)
+            self.assertEqual(SceneRenderIdeaPipeline.portrait_calls[0]["reference_views"], ["front"])
+            self.assertEqual(SceneRenderIdeaPipeline.portrait_calls[0]["image_size"], "720x1280")
+            self.assertEqual(SceneRenderScriptPipeline.render_calls[0]["render_options"], {
+                "aspect_ratio": "9:16",
+                "resolution": "720P",
+                "seconds": 5,
+                "image_size": "720x1280",
+            })
