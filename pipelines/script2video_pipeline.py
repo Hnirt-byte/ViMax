@@ -12,6 +12,7 @@ import yaml
 from interfaces import *
 from langchain.chat_models import init_chat_model
 from tools.render_backend import RenderBackend
+from tools.video_generator_agnes_api import AgnesVideoAPIError
 from utils.provider_presets import resolve_chat_model_config
 
 
@@ -292,17 +293,26 @@ class Script2VideoPipeline:
             for camera in camera_tree
         ]
 
+        await asyncio.gather(*tasks)
+
+        for shot_description in sorted(shot_descriptions, key=lambda shot: shot.idx):
+            prompt, frame_paths, parameters = self._video_request_details(shot_description, render_options)
+            if not all(os.path.exists(path) for path in frame_paths):
+                raise FileNotFoundError(f"Video references are missing for shot {shot_description.idx}")
+            self._write_video_request_artifact(
+                shot_idx=shot_description.idx,
+                prompt=prompt,
+                reference_image_paths=frame_paths,
+                parameters=parameters,
+            )
+
         _emit_render_progress(progress, "video_clips_start", "Generating video clips for shots", {"shot_count": len(shot_descriptions)})
-        video_tasks = [
-            self.generate_video_for_single_shot(
+        for shot_description in sorted(shot_descriptions, key=lambda shot: shot.idx):
+            await self.generate_video_for_single_shot(
                 shot_description=shot_description,
                 progress=progress,
                 render_options=render_options,
             )
-            for shot_description in shot_descriptions
-        ]
-        tasks.extend(video_tasks)
-        await asyncio.gather(*tasks)
 
         final_video_path = os.path.join(self.working_dir, "final_video.mp4")
         if os.path.exists(final_video_path):
@@ -313,7 +323,7 @@ class Script2VideoPipeline:
             _emit_render_progress(progress, "concat_start", "Concatenating video clips", {"shot_count": len(shot_descriptions)})
             video_clips = [
                 VideoFileClip(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video.mp4"))
-                for shot_description in shot_descriptions
+                for shot_description in sorted(shot_descriptions, key=lambda shot: shot.idx)
             ]
             final_video = concatenate_videoclips(video_clips)
             final_video.write_videofile(final_video_path, codec="libx264", preset="medium")
@@ -496,6 +506,21 @@ class Script2VideoPipeline:
 
 
 
+    def _video_request_details(
+        self,
+        shot_description: ShotDescription,
+        render_options: Optional[Dict[str, Any]],
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        frame_paths = [os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "first_frame.png")]
+        if shot_description.variation_type in ["medium", "large"]:
+            frame_paths.append(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "last_frame.png"))
+        parameters = {
+            option_name: (render_options or {})[option_name]
+            for option_name in ("aspect_ratio", "resolution", "seconds")
+            if (render_options or {}).get(option_name) is not None
+        }
+        return shot_description.motion_desc + "\n" + shot_description.audio_desc, frame_paths, parameters
+
     async def generate_video_for_single_shot(
         self,
         shot_description: ShotDescription,
@@ -512,28 +537,118 @@ class Script2VideoPipeline:
             if shot_description.variation_type in ["medium", "large"]:
                 await self.frame_events[shot_description.idx]["last_frame"].wait()
 
-            frame_paths = []
-            frame_paths.append(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "first_frame.png"))
-            if shot_description.variation_type in ["medium", "large"]:
-                frame_paths.append(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "last_frame.png"))
-
+            prompt, frame_paths, parameters = self._video_request_details(shot_description, render_options)
             print(f"🎬 Starting video generation for shot {shot_description.idx}...")
             _emit_render_progress(progress, "video_clip_start", f"Generating video clip for shot {shot_description.idx}", {"shot_idx": shot_description.idx, "frame_count": len(frame_paths)})
             video_kwargs = {
-                "prompt": shot_description.motion_desc + "\n" + shot_description.audio_desc,
+                "prompt": prompt,
                 "reference_image_paths": frame_paths,
                 "progress": _scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
+                **parameters,
             }
-            for option_name in ("aspect_ratio", "resolution", "seconds"):
-                value = (render_options or {}).get(option_name)
-                if value is not None:
-                    video_kwargs[option_name] = value
-            video_output = await self.video_generator.generate_single_video(
-                **video_kwargs,
+            request_path = os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video_request.json")
+            if not os.path.exists(request_path):
+                self._write_video_request_artifact(
+                    shot_idx=shot_description.idx,
+                    prompt=prompt,
+                    reference_image_paths=frame_paths,
+                    parameters=parameters,
+                )
+            with open(request_path, "r", encoding="utf-8") as handle:
+                request = json.load(handle)
+            if not isinstance(request, dict) or request.get("status") != "pending_video_submit":
+                raise RuntimeError(f"Persisted video request for shot {shot_description.idx} must be resumed instead of submitted again")
+            self._update_video_request_artifact(
+                shot_description.idx,
+                status="submitting",
+                last_attempt=time.strftime("%Y-%m-%dT%H:%M:%S"),
             )
+            video_kwargs["task_created_callback"] = lambda video_id, model: self._update_video_request_artifact(
+                shot_description.idx,
+                status="polling",
+                video_id=video_id,
+                model=model,
+                last_attempt=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                submit_attempt_increment=1,
+            )
+            try:
+                video_output = await self.video_generator.generate_single_video(
+                    **video_kwargs,
+                )
+            except AgnesVideoAPIError as exc:
+                exc.shot_idx = shot_description.idx
+                raise
             video_output.save(video_path)
+            self._update_video_request_artifact(
+                shot_description.idx,
+                status="completed",
+                last_attempt=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
             print(f"☑️ Generated video for shot {shot_description.idx}, saved to {video_path}.")
             _emit_render_progress(progress, "video_clip_done", f"Generated video clip for shot {shot_description.idx}", {"shot_idx": shot_description.idx, "path": video_path})
+
+    def _write_video_request_artifact(
+        self,
+        *,
+        shot_idx: int,
+        prompt: str,
+        reference_image_paths: List[str],
+        parameters: Dict[str, Any],
+    ) -> None:
+        shot_dir = os.path.join(self.working_dir, "shots", f"{shot_idx}")
+        request_path = os.path.join(shot_dir, "video_request.json")
+        if os.path.exists(request_path):
+            return
+        provider_model = getattr(self.video_generator, "model", None)
+        payload = {
+            "schema_version": 1,
+            "shot_idx": shot_idx,
+            "provider": type(self.video_generator).__name__,
+            "model": provider_model if isinstance(provider_model, str) else None,
+            "prompt": prompt,
+            "reference_image_paths": [os.path.relpath(path, self.working_dir) for path in reference_image_paths],
+            "parameters": parameters,
+            "output_path": os.path.relpath(os.path.join(shot_dir, "video.mp4"), self.working_dir),
+            "status": "pending_video_submit",
+            "last_attempt": None,
+            "submit_attempts": 0,
+            "video_id": None,
+        }
+        temp_path = request_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, request_path)
+
+    def _update_video_request_artifact(
+        self,
+        shot_idx: int,
+        *,
+        status: str,
+        video_id: str | None = None,
+        model: str | None = None,
+        last_attempt: str | None = None,
+        submit_attempt_increment: int = 0,
+    ) -> None:
+        request_path = os.path.join(self.working_dir, "shots", f"{shot_idx}", "video_request.json")
+        with open(request_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid persisted video request: {request_path}")
+        previous_attempts = payload.get("submit_attempts", 0)
+        if not isinstance(previous_attempts, int) or previous_attempts < 0:
+            raise ValueError(f"Invalid submit_attempts in {request_path}")
+        payload["status"] = status
+        if video_id is not None:
+            payload["video_id"] = video_id
+        if model:
+            payload["model"] = model
+        if last_attempt:
+            payload["last_attempt"] = last_attempt
+        payload["submit_attempts"] = previous_attempts + submit_attempt_increment
+        temp_path = request_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, request_path)
 
     async def generate_frame_for_single_shot(
         self,

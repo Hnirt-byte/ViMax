@@ -72,6 +72,31 @@ class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertGreaterEqual(limiter.acquire.await_count, 2)
 
+    async def test_persists_task_id_before_polling(self):
+        created = []
+
+        async def fake_get(url, *, headers, timeout):
+            self.assertEqual(created, [("task-persisted", "agnes-video-2.5-flash")])
+            return 200, {"status": "completed", "url": "https://cdn.example.test/result.mp4"}
+
+        provider = AgnesVideoProvider(api_key="test-key", poll_interval_seconds=0)
+        with patch("tools.video_generator_agnes_api._post_json", AsyncMock(return_value=(200, {"video_id": "task-persisted"}))), \
+             patch("tools.video_generator_agnes_api._get_json", fake_get), \
+             patch("tools.video_generator_agnes_api._get_bytes", AsyncMock(return_value=(200, b"video"))):
+            await provider.generate_single_video(
+                "A lantern floats above water.",
+                task_created_callback=lambda video_id, model: created.append((video_id, model)),
+            )
+
+    async def test_polls_existing_video_id_without_submitting_again(self):
+        provider = AgnesVideoProvider(api_key="test-key", poll_interval_seconds=0)
+        with patch("tools.video_generator_agnes_api._post_json", AsyncMock(side_effect=AssertionError("must not submit"))), \
+             patch("tools.video_generator_agnes_api._get_json", AsyncMock(return_value=(200, {"status": "completed", "url": "https://cdn.example.test/result.mp4"}))), \
+             patch("tools.video_generator_agnes_api._get_bytes", AsyncMock(return_value=(200, b"video"))):
+            output = await provider.poll_existing_task("task-existing", "agnes-video-2.5-flash")
+
+        self.assertEqual(output.data, b"video")
+
     async def test_polls_queued_task_until_completion(self):
         post = AsyncMock(return_value=(200, {"id": "task-2"}))
         get = AsyncMock(side_effect=[
@@ -239,9 +264,10 @@ class AgnesVideoProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("tools.video_generator_agnes_api._post_json", post), \
              patch("tools.video_generator_agnes_api.asyncio.sleep", sleeps):
-            with self.assertRaisesRegex(AgnesVideoAPIError, "video_queue_full"):
+            with self.assertRaisesRegex(AgnesVideoAPIError, "video_queue_full") as raised:
                 await provider.generate_single_video("A lantern floats above water.")
 
+        self.assertEqual(raised.exception.queue_attempts, 3)
         self.assertEqual(post.await_count, 3)
         self.assertEqual([call.args[0] for call in sleeps.await_args_list], [30, 60])
 

@@ -6,6 +6,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -25,9 +26,10 @@ from tools.image_generator_agnes_api import AgnesImageProvider
 from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
 from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
 from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
-from tools.video_generator_agnes_api import AgnesVideoProvider
+from tools.video_generator_agnes_api import AgnesVideoAPIError, AgnesVideoProvider, _is_video_queue_full_error
 from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
+from utils.video import concatenate_video_files
 
 from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_allow_paid_fallback, video_api_key, video_base_url, video_model, video_paid_fallback_model, video_provider
 from .models import ToolResult
@@ -104,6 +106,18 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
             handler=adapter.vimax_render_scene,
             schema={
                 "session_id": ToolArgumentSchema(str, required=False, default=""),
+                "scene_id": ToolArgumentSchema(str, required=True),
+            },
+        ),
+        ToolSpec(
+            name="vimax_resume_waiting_scene",
+            description=(
+                "Resume exactly one idea2video scene previously saved as waiting_for_video_capacity. "
+                "It reuses persisted video parameters and references, performs no image generation, and polls an existing video_id without submitting a duplicate job."
+            ),
+            handler=adapter.vimax_resume_waiting_scene,
+            schema={
+                "session_id": ToolArgumentSchema(str, required=True),
                 "scene_id": ToolArgumentSchema(str, required=True),
             },
         ),
@@ -551,6 +565,29 @@ class ViMaxAdapters:
             return ToolResult("vimax_render_scene", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
         except Exception as exc:
             unwrapped = _unwrap_retry_error(exc)
+            if _is_video_queue_full_error(unwrapped):
+                try:
+                    payload = _persist_waiting_video_capacity_state(
+                        session_id=session_id,
+                        scene_id=scene_id,
+                        scene_dir=scene_dir,
+                        error=unwrapped,
+                    )
+                    self.session_index.update_stage(session_id, "waiting_for_video_capacity", f"Waiting for Agnes video capacity for {scene_id}")
+                    _write_render_status(scene_dir, status="waiting_for_video_capacity", payload=payload)
+                    if runtime:
+                        runtime.emit_progress("Agnes video queue is full; scene saved for resume", stage="waiting_for_video_capacity", metadata=payload)
+                    return ToolResult("vimax_render_scene", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
+                except Exception as persist_exc:
+                    error_text = _sanitize_error_text(str(_unwrap_retry_error(persist_exc)))
+                    payload = {
+                        "error_type": "waiting_state_persistence_failed",
+                        "session_id": session_id,
+                        "scene_id": scene_id,
+                        "error": error_text,
+                    }
+                    _write_render_status(scene_dir, status="error", payload=payload)
+                    return ToolResult("vimax_render_scene", False, f"Could not persist waiting video state: {error_text}", payload)
             error_text = _sanitize_error_text(str(unwrapped))
             self.session_index.update_stage(session_id, "error", f"Scene {scene_id} render failed: {error_text}")
             payload = {
@@ -564,6 +601,143 @@ class ViMaxAdapters:
             if runtime:
                 runtime.emit_progress("Selected scene render failed; partial artifacts were kept", stage="scene_render_failed", metadata=payload)
             return ToolResult("vimax_render_scene", False, f"Render failed: {error_text}", payload)
+
+    async def vimax_resume_waiting_scene(self, args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
+        session_id = str(args.get("session_id", "") or "").strip()
+        scene_id = str(args.get("scene_id", "") or "").strip()
+        session = self.session_index.get(session_id) if session_id else None
+        if session is None:
+            return ToolResult("vimax_resume_waiting_scene", False, "A valid session_id is required.", {"error_type": "missing_session", "session_id": session_id})
+        if not _is_valid_idea_scene_id(scene_id):
+            return ToolResult("vimax_resume_waiting_scene", False, "scene_id must use the exact format scene_<n>.", {"error_type": "invalid_scene_id", "session_id": session_id, "scene_id": scene_id})
+        scene_dir = self.session_index.working_dir(session_id) / "idea2video" / scene_id
+        try:
+            state_path = _resolve_scene_artifact_path(scene_dir, "waiting_video_capacity.json")
+            if not state_path.exists():
+                return ToolResult("vimax_resume_waiting_scene", False, "No waiting video-capacity state exists for this scene.", {"error_type": "waiting_state_missing", "session_id": session_id, "scene_id": scene_id})
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("session_id") != session_id or state.get("scene_id") != scene_id:
+                return ToolResult("vimax_resume_waiting_scene", False, "Waiting state does not match the requested session and scene.", {"error_type": "invalid_waiting_state", "session_id": session_id, "scene_id": scene_id})
+            jobs = state.get("jobs")
+            if not isinstance(jobs, list) or not jobs:
+                return ToolResult("vimax_resume_waiting_scene", False, "Waiting state has no resumable video jobs.", {"error_type": "invalid_waiting_state", "session_id": session_id, "scene_id": scene_id})
+            jobs = sorted(jobs, key=lambda job: job["shot_idx"] if isinstance(job, dict) and isinstance(job.get("shot_idx"), int) else -1)
+            shot_indices = [job.get("shot_idx") for job in jobs if isinstance(job, dict)]
+            if len(shot_indices) != len(jobs) or any(not isinstance(shot_idx, int) or shot_idx < 0 for shot_idx in shot_indices) or len(set(shot_indices)) != len(shot_indices):
+                return ToolResult("vimax_resume_waiting_scene", False, "Waiting state contains invalid or duplicate shot indices.", {"error_type": "invalid_waiting_state", "session_id": session_id, "scene_id": scene_id})
+            expected_shot_indices = state.get("expected_shot_indices")
+            if not isinstance(expected_shot_indices, list) or any(not isinstance(shot_idx, int) or shot_idx < 0 for shot_idx in expected_shot_indices) or len(set(expected_shot_indices)) != len(expected_shot_indices) or sorted(expected_shot_indices) != shot_indices:
+                return ToolResult("vimax_resume_waiting_scene", False, "Waiting state is missing one or more planned video jobs.", {"error_type": "incomplete_waiting_state", "session_id": session_id, "scene_id": scene_id})
+            video_generator = _build_video_generator()
+            if not isinstance(video_generator, AgnesVideoProvider):
+                return ToolResult("vimax_resume_waiting_scene", False, "Waiting scene requires AgnesVideoProvider.", {"error_type": "provider_mismatch", "session_id": session_id, "scene_id": scene_id})
+        except Exception as exc:
+            error_text = _sanitize_error_text(str(_unwrap_retry_error(exc)))
+            return ToolResult("vimax_resume_waiting_scene", False, f"Resume state could not be loaded: {error_text}", {"error_type": "invalid_waiting_state", "session_id": session_id, "scene_id": scene_id, "error": error_text})
+
+        def persist(status: str) -> None:
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            for job in jobs:
+                if not isinstance(job, dict):
+                    raise ValueError("Invalid waiting video job")
+                shot_idx = job.get("shot_idx")
+                if not isinstance(shot_idx, int) or shot_idx < 0:
+                    raise ValueError("Waiting video job missing shot_idx")
+                request_path = _resolve_scene_artifact_path(scene_dir, f"shots/{shot_idx}/video_request.json")
+                _atomic_write_json(request_path, {"schema_version": 1, **job})
+            primary = next((job for job in jobs if job.get("status") != "completed"), jobs[0])
+            state.update({
+                "provider": primary.get("provider"), "model": primary.get("model"), "parameters": primary.get("parameters"),
+                "reference_image_paths": primary.get("reference_image_paths"), "status": status, "last_attempt": timestamp,
+                "submit_attempts": sum(int(job.get("submit_attempts", 0)) for job in jobs), "video_id": primary.get("video_id"), "jobs": jobs,
+            })
+            _atomic_write_json(state_path, state)
+
+        try:
+            for job in jobs:
+                if not isinstance(job, dict) or job.get("status") == "completed":
+                    continue
+                shot_idx = job["shot_idx"]
+                model = job.get("model")
+                if not isinstance(model, str):
+                    raise RuntimeError("Persisted video job is missing its model")
+                if job.get("provider") != "AgnesVideoProvider":
+                    raise RuntimeError("Persisted video provider does not match AgnesVideoProvider")
+                output_rel = job.get("output_path")
+                if not isinstance(output_rel, str):
+                    raise ValueError("Waiting video job missing output_path")
+                output_path = _resolve_scene_artifact_path(scene_dir, output_rel)
+                video_id = job.get("video_id")
+                if isinstance(video_id, str) and video_id:
+                    output = await video_generator.poll_existing_task(video_id, model, progress=None)
+                else:
+                    if job.get("status") != "waiting_for_video_capacity":
+                        return ToolResult("vimax_resume_waiting_scene", False, "Persisted video job is not eligible for a new submission.", {"error_type": "invalid_waiting_job_status", "session_id": session_id, "scene_id": scene_id, "shot_idx": shot_idx})
+                    if model != video_generator.model:
+                        raise RuntimeError("Persisted video model does not match the configured Agnes provider model")
+                    raw_refs = job.get("reference_image_paths")
+                    if not isinstance(raw_refs, list):
+                        raise ValueError("Waiting video job missing reference_image_paths")
+                    refs = [_resolve_scene_artifact_path(scene_dir, str(ref)) for ref in raw_refs]
+                    if not refs or not all(path.exists() for path in refs):
+                        raise RuntimeError("Persisted video references are missing")
+                    job.update({"status": "submitting", "last_attempt": datetime.now().isoformat(timespec="seconds")})
+                    persist("waiting_for_video_capacity")
+                    def task_created(task_id: str, selected_model: str, current_job: dict[str, Any] = job) -> None:
+                        current_job.update({"video_id": task_id, "model": selected_model, "status": "polling", "submit_attempts": int(current_job.get("submit_attempts", 0)) + 1})
+                        persist("waiting_for_video_capacity")
+                    try:
+                        output = await video_generator.generate_single_video(
+                            prompt=str(job.get("prompt") or ""), reference_image_paths=[str(path) for path in refs],
+                            task_created_callback=task_created, **dict(job.get("parameters") or {}),
+                        )
+                    except AgnesVideoAPIError as exc:
+                        exc.shot_idx = shot_idx
+                        raise
+                output.save(str(output_path))
+                job["status"] = "completed"
+            if any(job.get("status") != "completed" for job in jobs):
+                raise RuntimeError("Cannot assemble a scene until every persisted video job is completed")
+            final_path = _resolve_scene_artifact_path(scene_dir, "final_video.mp4")
+            clips = [_resolve_scene_artifact_path(scene_dir, str(job["output_path"])) for job in jobs]
+            if not all(path.exists() for path in clips):
+                raise RuntimeError("Cannot assemble a scene because one or more completed video clips are missing")
+            if len(clips) == 1:
+                shutil.copyfile(clips[0], final_path)
+            else:
+                concatenate_video_files([str(path) for path in clips], str(final_path))
+            persist("rendered")
+            self.session_index.update_stage(session_id, "scene_rendered", f"Resumed and rendered {scene_id}")
+            payload = {"session_id": session_id, "scene_id": scene_id, "status": "rendered", "render_completed": True, "scene_video_path": str(final_path.relative_to(self.workspace_root))}
+            _write_render_status(scene_dir, status="rendered", payload=payload)
+            return ToolResult("vimax_resume_waiting_scene", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
+        except Exception as exc:
+            unwrapped = _unwrap_retry_error(exc)
+            if _is_video_queue_full_error(unwrapped):
+                failed_shot_idx = getattr(unwrapped, "shot_idx", None)
+                if not isinstance(failed_shot_idx, int):
+                    return ToolResult("vimax_resume_waiting_scene", False, "Resume could not identify the saturated video job safely.", {"error_type": "resume_failed", "session_id": session_id, "scene_id": scene_id})
+                queue_attempts = max(1, int(getattr(unwrapped, "queue_attempts", 1)))
+                failed_job = next((job for job in jobs if job.get("shot_idx") == failed_shot_idx), None)
+                if not isinstance(failed_job, dict):
+                    return ToolResult("vimax_resume_waiting_scene", False, "Resume could not identify the saturated video job safely.", {"error_type": "resume_failed", "session_id": session_id, "scene_id": scene_id})
+                failed_job.update({
+                    "status": "waiting_for_video_capacity",
+                    "last_error_code": "video_queue_full",
+                    "last_attempt": datetime.now().isoformat(timespec="seconds"),
+                    "submit_attempts": int(failed_job.get("submit_attempts", 0)) + queue_attempts,
+                })
+                try:
+                    persist("waiting_for_video_capacity")
+                except Exception as persist_exc:
+                    error_text = _sanitize_error_text(str(_unwrap_retry_error(persist_exc)))
+                    return ToolResult("vimax_resume_waiting_scene", False, f"Could not persist waiting video state: {error_text}", {"error_type": "waiting_state_persistence_failed", "session_id": session_id, "scene_id": scene_id, "error": error_text})
+                self.session_index.update_stage(session_id, "waiting_for_video_capacity", f"Waiting for Agnes video capacity for {scene_id}")
+                payload = {"session_id": session_id, "scene_id": scene_id, "status": "waiting_for_video_capacity", "render_completed": False, "jobs": jobs}
+                _write_render_status(scene_dir, status="waiting_for_video_capacity", payload=payload)
+                return ToolResult("vimax_resume_waiting_scene", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
+            error_text = _sanitize_error_text(str(unwrapped))
+            return ToolResult("vimax_resume_waiting_scene", False, f"Resume failed: {error_text}", {"error_type": "resume_failed", "session_id": session_id, "scene_id": scene_id, "error": error_text})
 
     def _resolve_session(self, session_id: str, *, idea: str, script: str, user_requirement: str, style: str) -> dict[str, Any]:
         requested_source = idea or script
@@ -858,6 +1032,89 @@ def _sanitize_error_text(text: str) -> str:
             break
         sanitized = prefix + "sk-<redacted>" + rest[len(token):]
     return sanitized
+
+
+def _resolve_scene_artifact_path(scene_dir: Path, relative_path: str) -> Path:
+    candidate = (scene_dir / relative_path).resolve()
+    try:
+        candidate.relative_to(scene_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("Persisted scene artifact path escapes the scene directory") from exc
+    return candidate
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def _persist_waiting_video_capacity_state(
+    *,
+    session_id: str,
+    scene_id: str,
+    scene_dir: Path,
+    error: BaseException,
+) -> dict[str, Any]:
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    queue_attempts = max(1, int(getattr(error, "queue_attempts", 1)))
+    jobs: list[dict[str, Any]] = []
+    entries: list[tuple[int, Path, dict[str, Any]]] = []
+    for request_path in (scene_dir / "shots").glob("*/video_request.json"):
+        safe_path = _resolve_scene_artifact_path(scene_dir, str(request_path.relative_to(scene_dir)))
+        raw = json.loads(safe_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(f"Invalid persisted video request: {safe_path}")
+        shot_idx = raw.get("shot_idx")
+        if not isinstance(shot_idx, int) or shot_idx < 0:
+            raise ValueError(f"Invalid shot_idx in {safe_path}")
+        entries.append((shot_idx, safe_path, raw))
+    failed_shot_idx = getattr(error, "shot_idx", None)
+    if not isinstance(failed_shot_idx, int):
+        incomplete_shots = [
+            shot_idx for shot_idx, _, raw in entries
+            if raw.get("status") != "completed" and not raw.get("video_id")
+        ]
+        if len(incomplete_shots) != 1:
+            raise RuntimeError("Agnes video queue was full but the failing shot was not identified")
+        failed_shot_idx = incomplete_shots[0]
+    for shot_idx, request_path, raw in sorted(entries, key=lambda item: item[0]):
+        prior_attempts = raw.get("submit_attempts", 0)
+        if not isinstance(prior_attempts, int) or prior_attempts < 0:
+            raise ValueError(f"Invalid submit_attempts in {request_path}")
+        job = dict(raw)
+        if shot_idx == failed_shot_idx:
+            job.update({
+                "status": "waiting_for_video_capacity",
+                "last_attempt": timestamp,
+                "submit_attempts": prior_attempts + queue_attempts,
+                "last_error_code": "video_queue_full",
+            })
+        elif job.get("status") == "pending_video_submit":
+            job["status"] = "waiting_for_video_capacity"
+        _atomic_write_json(request_path, job)
+        jobs.append(job)
+    if not jobs:
+        raise RuntimeError("Agnes video queue was full but no persisted scene video request was found")
+    failed_job = next(job for job in jobs if job["shot_idx"] == failed_shot_idx)
+    state = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "scene_id": scene_id,
+        "provider": failed_job["provider"],
+        "model": failed_job["model"],
+        "parameters": failed_job["parameters"],
+        "reference_image_paths": failed_job["reference_image_paths"],
+        "status": "waiting_for_video_capacity",
+        "last_attempt": timestamp,
+        "submit_attempts": sum(job["submit_attempts"] for job in jobs),
+        "video_id": failed_job.get("video_id"),
+        "expected_shot_indices": [job["shot_idx"] for job in jobs],
+        "jobs": jobs,
+    }
+    _atomic_write_json(_resolve_scene_artifact_path(scene_dir, "waiting_video_capacity.json"), state)
+    return state
 
 
 def _write_render_status(working_dir: Path, *, status: str, payload: dict[str, Any]) -> None:

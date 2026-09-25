@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Any, Callable, Sequence
@@ -26,6 +27,9 @@ class AgnesVideoAPIError(RuntimeError):
     def __init__(self, status_code: int, payload: Any) -> None:
         self.status_code = status_code
         self.payload = payload
+        self.queue_attempts = 0
+        self.model: str | None = None
+        self.shot_idx: int | None = None
         super().__init__(f"Agnes video generation failed with HTTP {status_code}: {payload}")
 
 
@@ -134,8 +138,25 @@ class AgnesVideoProvider:
             )
             _, response = await self._create_task(model=model, payload=payload, progress=progress)
         task_id = _task_id_from_response(response)
+        task_created_callback = kwargs.get("task_created_callback")
+        if callable(task_created_callback):
+            callback_result = task_created_callback(task_id, model)
+            if inspect.isawaitable(callback_result):
+                await callback_result
         _emit_progress(progress, "video_task_created", "Agnes video task created", {"model": model, "task_id": task_id})
+        return await self.poll_existing_task(task_id, model, progress=progress)
 
+    async def poll_existing_task(
+        self,
+        task_id: str,
+        model: str,
+        *,
+        progress: Callable[[str, str, dict[str, Any]], None] | None = None,
+    ) -> VideoOutput:
+        if not task_id:
+            raise ValueError("Agnes video task_id is required for polling")
+        if not model:
+            raise ValueError("Agnes video model is required for polling")
         deadline = asyncio.get_running_loop().time() + self.poll_timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             _, result = await self._request_with_retry(
@@ -270,6 +291,8 @@ class AgnesVideoProvider:
             error = AgnesVideoAPIError(status, payload)
             if operation_name == "create" and _is_video_queue_full_error(error):
                 if queue_attempt >= self.queue_max_attempts:
+                    error.queue_attempts = queue_attempt
+                    error.model = model
                     raise error
                 await self._retry_after_queue_full(progress, queue_attempt, model)
                 queue_attempt += 1
