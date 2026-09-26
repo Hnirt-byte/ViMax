@@ -853,6 +853,37 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted["jobs"][0]["submit_attempts"], 10)
             self.assertEqual(persisted["jobs"][0]["status"], "waiting_for_video_capacity")
 
+    async def test_resume_once_dry_run_builds_provider_without_submit_or_state_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_1"
+            shot_dir = scene_dir / "shots" / "0"
+            shot_dir.mkdir(parents=True)
+            (shot_dir / "first_frame.png").write_bytes(b"cached-frame")
+            request = {
+                "schema_version": 1, "shot_idx": 0, "provider": "AgnesVideoProvider", "model": "agnes-video-2.5-flash",
+                "prompt": "cached", "reference_image_paths": ["shots/0/first_frame.png"], "parameters": {"seconds": 5},
+                "output_path": "shots/0/video.mp4", "status": "waiting_for_video_capacity", "last_attempt": None,
+                "submit_attempts": 9, "video_id": None,
+            }
+            request_path = shot_dir / "video_request.json"
+            state_path = scene_dir / "waiting_video_capacity.json"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+            state_path.write_text(json.dumps({"schema_version": 1, "session_id": record["session_id"], "scene_id": "scene_1", "status": "waiting_for_video_capacity", "expected_shot_indices": [0], "jobs": [request]}), encoding="utf-8")
+            before = (state_path.read_bytes(), request_path.read_bytes())
+            provider = AgnesVideoProvider(api_key="test-key", model="agnes-video-2.5-flash")
+            provider.generate_single_video = AsyncMock(side_effect=AssertionError("dry run must not submit"))
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_video_generator", return_value=provider):
+                result = await adapter.vimax_resume_waiting_scene_once({"session_id": record["session_id"], "scene_id": "scene_1", "dry_run": True})
+            self.assertTrue(result.ok)
+            self.assertTrue(result.metadata["dry_run"])
+            self.assertEqual(result.metadata["provider"], "AgnesVideoProvider")
+            self.assertEqual(result.metadata["model"], "agnes-video-2.5-flash")
+            provider.generate_single_video.assert_not_awaited()
+            self.assertEqual((state_path.read_bytes(), request_path.read_bytes()), before)
+
     async def test_resume_once_persists_video_id_and_never_enters_long_poll(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)

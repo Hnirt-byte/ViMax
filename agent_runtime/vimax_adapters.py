@@ -866,6 +866,21 @@ class ViMaxAdapters:
         model = str(job["model"])
         if model != video_generator.model:
             return ToolResult("vimax_resume_waiting_scene_once", False, "Configured video provider does not match the persisted job model; no submission was made.", {"error_type": "provider_error", "session_id": session_id, "scene_id": scene_id, "shot_idx": shot_idx})
+        if args.get("dry_run") is True:
+            return ToolResult(
+                "vimax_resume_waiting_scene_once",
+                True,
+                "Resume preflight succeeded; no Agnes request or state change was made.",
+                {
+                    "session_id": session_id,
+                    "scene_id": scene_id,
+                    "status": str(job["status"]),
+                    "provider": type(video_generator).__name__,
+                    "model": model,
+                    "dry_run": True,
+                    "render_completed": False,
+                },
+            )
         video_id = job.get("video_id")
         if isinstance(video_id, str) and video_id:
             try:
