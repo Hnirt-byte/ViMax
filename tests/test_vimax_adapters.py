@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from interfaces import Camera, CharacterInScene, ShotBriefDescription, ShotDescription
 from agent_runtime.session_index import SessionIndex
@@ -820,6 +820,149 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             provider.generate_single_video.assert_not_awaited()
             self.assertTrue((scene_dir / "shots" / "0" / "video.mp4").exists())
             self.assertTrue((scene_dir / "final_video.mp4").exists())
+
+    async def test_resume_once_queue_full_submits_exactly_once_and_returns_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_1"
+            shot_dir = scene_dir / "shots" / "0"
+            shot_dir.mkdir(parents=True)
+            (shot_dir / "first_frame.png").write_bytes(b"cached-frame")
+            request = {
+                "schema_version": 1, "shot_idx": 0, "provider": "AgnesVideoProvider", "model": "agnes-video-2.5-flash",
+                "prompt": "cached", "reference_image_paths": ["shots/0/first_frame.png"], "parameters": {"seconds": 5},
+                "output_path": "shots/0/video.mp4", "status": "waiting_for_video_capacity", "last_attempt": None,
+                "submit_attempts": 9, "video_id": None,
+            }
+            (shot_dir / "video_request.json").write_text(json.dumps(request), encoding="utf-8")
+            state = {"schema_version": 1, "session_id": record["session_id"], "scene_id": "scene_1", "status": "waiting_for_video_capacity", "expected_shot_indices": [0], "jobs": [request]}
+            (scene_dir / "waiting_video_capacity.json").write_text(json.dumps(state), encoding="utf-8")
+            provider = AgnesVideoProvider(api_key="test-key", model="agnes-video-2.5-flash", queue_max_attempts=3, max_retries=3, allow_paid_video_fallback=True)
+            provider.generate_single_video = AsyncMock(side_effect=AgnesVideoAPIError(503, {"code": "video_queue_full"}))
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_video_generator", return_value=provider):
+                result = await adapter.vimax_resume_waiting_scene_once({"session_id": record["session_id"], "scene_id": "scene_1"})
+            self.assertTrue(result.ok)
+            self.assertEqual(result.metadata["status"], "waiting_for_video_capacity")
+            provider.generate_single_video.assert_awaited_once()
+            self.assertEqual(provider.queue_max_attempts, 1)
+            self.assertEqual(provider.max_retries, 1)
+            self.assertFalse(provider.allow_paid_video_fallback)
+            persisted = json.loads((scene_dir / "waiting_video_capacity.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["jobs"][0]["submit_attempts"], 10)
+            self.assertEqual(persisted["jobs"][0]["status"], "waiting_for_video_capacity")
+
+    async def test_resume_once_persists_video_id_and_never_enters_long_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_1"
+            shot_dir = scene_dir / "shots" / "0"
+            shot_dir.mkdir(parents=True)
+            (shot_dir / "first_frame.png").write_bytes(b"cached-frame")
+            request = {
+                "schema_version": 1, "shot_idx": 0, "provider": "AgnesVideoProvider", "model": "agnes-video-2.5-flash",
+                "prompt": "cached", "reference_image_paths": ["shots/0/first_frame.png"], "parameters": {"seconds": 5},
+                "output_path": "shots/0/video.mp4", "status": "waiting_for_video_capacity", "last_attempt": None,
+                "submit_attempts": 0, "video_id": None,
+            }
+            (shot_dir / "video_request.json").write_text(json.dumps(request), encoding="utf-8")
+            state = {"schema_version": 1, "session_id": record["session_id"], "scene_id": "scene_1", "status": "waiting_for_video_capacity", "expected_shot_indices": [0], "jobs": [request]}
+            (scene_dir / "waiting_video_capacity.json").write_text(json.dumps(state), encoding="utf-8")
+            provider = AgnesVideoProvider(api_key="test-key", model="agnes-video-2.5-flash")
+            async def create(**kwargs):
+                kwargs["task_created_callback"]("task-live", "agnes-video-2.5-flash")
+                raise AssertionError("callback must stop before provider polling")
+            provider.generate_single_video = AsyncMock(side_effect=create)
+            provider.poll_existing_task = AsyncMock(side_effect=AssertionError("must not poll after create"))
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_video_generator", return_value=provider):
+                result = await adapter.vimax_resume_waiting_scene_once({"session_id": record["session_id"], "scene_id": "scene_1"})
+            self.assertTrue(result.ok)
+            self.assertEqual(result.metadata["status"], "polling")
+            provider.generate_single_video.assert_awaited_once()
+            provider.poll_existing_task.assert_not_awaited()
+            persisted = json.loads((scene_dir / "waiting_video_capacity.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["status"], "polling")
+            self.assertEqual(persisted["jobs"][0]["status"], "polling")
+            self.assertTrue(persisted["jobs"][0]["video_id"])
+
+    async def test_resume_once_classifies_missing_video_credential_without_submit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_1"
+            shot_dir = scene_dir / "shots" / "0"
+            shot_dir.mkdir(parents=True)
+            (shot_dir / "first_frame.png").write_bytes(b"cached-frame")
+            job = {"schema_version": 1, "shot_idx": 0, "provider": "AgnesVideoProvider", "model": "agnes-video-2.5-flash", "prompt": "cached", "reference_image_paths": ["shots/0/first_frame.png"], "parameters": {"seconds": 5}, "output_path": "shots/0/video.mp4", "status": "waiting_for_video_capacity", "submit_attempts": 0, "video_id": None}
+            (shot_dir / "video_request.json").write_text(json.dumps(job), encoding="utf-8")
+            (scene_dir / "waiting_video_capacity.json").write_text(json.dumps({"schema_version": 1, "session_id": record["session_id"], "scene_id": "scene_1", "status": "waiting_for_video_capacity", "expected_shot_indices": [0], "jobs": [job]}), encoding="utf-8")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            builder = MagicMock(side_effect=RuntimeError("VIMAX_VIDEO_API_KEY is required for video generation"))
+            with patch("agent_runtime.vimax_adapters._build_video_generator", builder):
+                result = await adapter.vimax_resume_waiting_scene_once({"session_id": record["session_id"], "scene_id": "scene_1"})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "missing_credentials")
+            builder.assert_called_once()
+
+    async def test_resume_once_classifies_invalid_state_without_building_or_submitting_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_1"
+            scene_dir.mkdir(parents=True)
+            (scene_dir / "waiting_video_capacity.json").write_text(json.dumps({"schema_version": 1, "session_id": record["session_id"], "scene_id": "scene_1", "status": "waiting_for_video_capacity", "expected_shot_indices": [0], "jobs": []}), encoding="utf-8")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            builder = MagicMock(side_effect=AssertionError("provider must not initialize"))
+            with patch("agent_runtime.vimax_adapters._build_video_generator", builder):
+                result = await adapter.vimax_resume_waiting_scene_once({"session_id": record["session_id"], "scene_id": "scene_1"})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "invalid_waiting_state")
+            builder.assert_not_called()
+
+    async def test_resume_once_rejects_completed_job_without_clip_before_provider_submit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_1"
+            shot_dir = scene_dir / "shots"
+            (shot_dir / "0").mkdir(parents=True)
+            (shot_dir / "1").mkdir(parents=True)
+            (shot_dir / "1" / "first_frame.png").write_bytes(b"cached-frame")
+            completed = {"schema_version": 1, "shot_idx": 0, "provider": "AgnesVideoProvider", "model": "agnes-video-2.5-flash", "prompt": "completed", "reference_image_paths": [], "parameters": {"seconds": 5}, "output_path": "shots/0/video.mp4", "status": "completed", "submit_attempts": 1, "video_id": "persisted-task"}
+            waiting = {"schema_version": 1, "shot_idx": 1, "provider": "AgnesVideoProvider", "model": "agnes-video-2.5-flash", "prompt": "waiting", "reference_image_paths": ["shots/1/first_frame.png"], "parameters": {"seconds": 5}, "output_path": "shots/1/video.mp4", "status": "waiting_for_video_capacity", "submit_attempts": 0, "video_id": None}
+            (shot_dir / "0" / "video_request.json").write_text(json.dumps(completed), encoding="utf-8")
+            (shot_dir / "1" / "video_request.json").write_text(json.dumps(waiting), encoding="utf-8")
+            state = {"schema_version": 1, "session_id": record["session_id"], "scene_id": "scene_1", "status": "waiting_for_video_capacity", "expected_shot_indices": [0, 1], "jobs": [completed, waiting]}
+            (scene_dir / "waiting_video_capacity.json").write_text(json.dumps(state), encoding="utf-8")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            builder = MagicMock(side_effect=AssertionError("provider must not initialize"))
+            with patch("agent_runtime.vimax_adapters._build_video_generator", builder):
+                result = await adapter.vimax_resume_waiting_scene_once({"session_id": record["session_id"], "scene_id": "scene_1"})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "invalid_waiting_state")
+            builder.assert_not_called()
+
+    async def test_resume_once_classifies_provider_initialization_error_without_submit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="paper airplane")
+            scene_dir = Path(tmp) / record["working_dir"] / "idea2video" / "scene_1"
+            shot_dir = scene_dir / "shots" / "0"
+            shot_dir.mkdir(parents=True)
+            (shot_dir / "first_frame.png").write_bytes(b"cached-frame")
+            job = {"schema_version": 1, "shot_idx": 0, "provider": "AgnesVideoProvider", "model": "agnes-video-2.5-flash", "prompt": "cached", "reference_image_paths": ["shots/0/first_frame.png"], "parameters": {"seconds": 5}, "output_path": "shots/0/video.mp4", "status": "waiting_for_video_capacity", "submit_attempts": 0, "video_id": None}
+            (shot_dir / "video_request.json").write_text(json.dumps(job), encoding="utf-8")
+            (scene_dir / "waiting_video_capacity.json").write_text(json.dumps({"schema_version": 1, "session_id": record["session_id"], "scene_id": "scene_1", "status": "waiting_for_video_capacity", "expected_shot_indices": [0], "jobs": [job]}), encoding="utf-8")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            builder = MagicMock(side_effect=RuntimeError("configured video provider failed to initialize"))
+            with patch("agent_runtime.vimax_adapters._build_video_generator", builder):
+                result = await adapter.vimax_resume_waiting_scene_once({"session_id": record["session_id"], "scene_id": "scene_1"})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "provider_error")
+            builder.assert_called_once()
 
     async def test_render_scene_reuses_existing_scene_video_without_initializing_providers(self):
         with tempfile.TemporaryDirectory() as tmp:
